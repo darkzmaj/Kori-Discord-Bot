@@ -55,6 +55,17 @@ impl AuditEvent {
     }
 }
 
+/// The operator's log webhook receives bot health (category "Bot", or no server) and events from its own server only:
+/// other servers' ticket activity never leaves those servers.
+pub(crate) fn for_operator(event: &AuditEvent, operator_guild: &str) -> bool {
+    event.category == "Bot" || event.guild.as_ref().and_then(|g| g.id.as_deref()).is_none_or(|id| id == operator_guild)
+}
+
+/// The sanitized embed for one event, for posting into a server's own log channel.
+pub fn render_event(event: AuditEvent) -> Value {
+    audit_embed(&safe_event(event))
+}
+
 /// Removes credentials and control characters before anything leaves Kori. `limit` counts chars.
 pub fn sanitize_audit_text(value: &str, limit: usize) -> String {
     static NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\r\n]+").unwrap());
@@ -209,8 +220,9 @@ impl AuditLogService {
         let safe = safe_event(event);
         {
             let mut state = self.inner.state.lock().unwrap();
-            if state.config.is_none() || state.stopping {
-                return;
+            match &state.config {
+                Some(config) if !state.stopping && for_operator(&safe, &config.guild_id) => {}
+                _ => return,
             }
             if state.queue.len() >= MAX_QUEUE {
                 if let Some(low) = state.queue.iter().position(AuditEvent::is_low) {
@@ -225,6 +237,12 @@ impl AuditLogService {
             state.queue.push_back(safe);
         }
         self.inner.start_worker();
+    }
+
+    /// Whether this server's events reach the operator's (verified) log webhook.
+    pub fn covers(&self, guild_id: &str) -> bool {
+        let state = self.inner.state.lock().unwrap();
+        state.enabled() && state.config.as_ref().is_some_and(|c| c.guild_id == guild_id)
     }
 
     /// Resolves once the delivery worker is idle (the TS tests' `await service.working`).
@@ -489,6 +507,20 @@ fn audit_embed(event: &AuditEvent) -> Value {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn operator_log_only_takes_its_own_server_and_bot_health() {
+        let event = |category: &str, guild: Option<&str>| AuditEvent {
+            category: category.into(),
+            guild: guild.map(|id| AuditSubject { id: Some(id.into()), name: None }),
+            ..Default::default()
+        };
+        assert!(for_operator(&event("Tickets", Some("1")), "1"));
+        assert!(!for_operator(&event("Tickets", Some("2")), "1"), "another server's ticket activity stays in that server");
+        assert!(!for_operator(&event("Ticket Configuration", Some("2")), "1"));
+        assert!(for_operator(&event("Bot", Some("2")), "1"), "joins and leaves are bot health");
+        assert!(for_operator(&event("Bot", None), "1"));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(crate) fn transport<F>(f: F) -> WebhookTransport
@@ -588,7 +620,7 @@ pub(crate) mod tests {
         }));
         service.initialize().await;
         service.record(AuditEvent {
-            guild: Some(AuditSubject::named("g", "@everyone")),
+            guild: Some(AuditSubject::named("123456789012345678", "@everyone")),
             reason: Some("https://discord.com/api/webhooks/123456789012345678/secret".into()),
             ..event("Member Muted", "Moderation")
         });
@@ -663,7 +695,7 @@ pub(crate) mod tests {
         }));
         service.initialize().await;
         for (title, category) in [("Admin Configuration Changed", "Admin Configuration"), ("Embed Scheduled", "Embeds"), ("Manual Backup Created", "Backups"), ("Restore Completed With Warnings", "Backups"), ("Restore Failed", "Backups")] {
-            service.record(AuditEvent { guild: Some(AuditSubject::named("g", "Guild")), ..event(title, category) });
+            service.record(AuditEvent { guild: Some(AuditSubject::named("123456789012345678", "Guild")), ..event(title, category) });
         }
         service.idle().await;
         assert_eq!(sent.load(Ordering::SeqCst), 5);

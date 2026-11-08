@@ -14,7 +14,7 @@ use crate::ctx;
 use crate::db::repositories::{GuildSettings, KoriRepository, PanelEmbed, Ticket, TicketType};
 use crate::discord::Discord;
 use crate::logger::log_discord_error;
-use crate::services::audit_log_service::{AuditEvent, AuditLogService, AuditSubject};
+use crate::services::audit_log_service::{AuditEvent, AuditSubject};
 use crate::services::authorization::{has_permission, PermissionLevel};
 use crate::services::ticket_service::{
     bot_allow, creatable, panel_components, panel_embed, parse_panel_embed, parse_welcome, valid_emoji, welcome_pings, welcome_view, PanelUpdate,
@@ -190,23 +190,16 @@ pub struct TicketUi {
     repo: Arc<KoriRepository>,
     tickets: Arc<TicketService>,
     uptime: Box<dyn Fn() -> String + Send + Sync>,
-    audit: Option<Arc<AuditLogService>>,
 }
 
 impl TicketUi {
-    pub fn new(
-        repo: Arc<KoriRepository>,
-        tickets: Arc<TicketService>,
-        uptime: impl Fn() -> String + Send + Sync + 'static,
-        audit: Option<Arc<AuditLogService>>,
-    ) -> Self {
-        TicketUi { repo, tickets, uptime: Box::new(uptime), audit }
+    pub fn new(repo: Arc<KoriRepository>, tickets: Arc<TicketService>, uptime: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        TicketUi { repo, tickets, uptime: Box::new(uptime) }
     }
 
     fn audit_configuration(&self, ctx: &Context, a: &Actor<'_>, title: &str, details: Vec<(&str, String)>) {
-        let Some(audit) = &self.audit else { return };
         let guild_name = ctx.cache.guild(a.guild_id).map(|g| g.name.clone()).unwrap_or_default();
-        audit.record(AuditEvent {
+        self.tickets.log(a.guild_id, AuditEvent {
             title: title.into(),
             category: "Ticket Configuration".into(),
             color: "warning".into(),
@@ -385,6 +378,21 @@ impl TicketUi {
                     .ephemeral(true);
                 a.respond(ctx, CreateInteractionResponse::Message(preview)).await
             }
+            ("logs", which @ ("pick" | "pickt")) => {
+                let (kind, what) = if which == "pick" { ("logset", "ticket activity logs") } else { ("transcriptset", "closed-ticket transcripts") };
+                let picker = select(
+                    format!("ticketui:{kind}:x:{g}"),
+                    CreateSelectMenuKind::Channel { channel_types: Some(vec![ChannelType::Text]), default_channels: None },
+                    "Select a text channel",
+                );
+                a.update(ctx, View::text(format!("Select the channel for {what}. Keep it private to staff."), vec![picker, row(vec![nav("logs", g, "← Back")])])).await
+            }
+            ("logs", which @ ("clear" | "cleart")) => {
+                let (key, title) = if which == "clear" { ("log_channel_id", "Ticket Log Channel Cleared") } else { ("transcript_channel_id", "Ticket Transcript Channel Cleared") };
+                self.repo.update_setting(&gs, key, rusqlite::types::Value::Null)?;
+                self.audit_configuration(ctx, &a, title, vec![]);
+                a.update(ctx, self.view(ctx, g, "logs")?).await
+            }
             ("panel", "send") => {
                 let picker = select(
                     format!("ticketui:panelsend:x:{g}"),
@@ -460,6 +468,7 @@ impl TicketUi {
                 None => a.update(ctx, self.view(ctx, g, "types")?.content(Some("That ticket type no longer exists.".into()))).await,
             },
             "panelsend" => self.send_panel(ctx, a, value).await,
+            "logset" | "transcriptset" => self.set_log_channel(ctx, a, kind == "logset", value).await,
             _ => Ok(()),
         }
     }
@@ -564,6 +573,48 @@ impl TicketUi {
         a.update(ctx, self.view(ctx, g, "setup")?.content(Some(notice))).await
     }
 
+    /// Saves a log or transcript channel only after Kori has posted a confirmation there, which proves it can.
+    async fn set_log_channel(&self, ctx: &Context, a: &Actor<'_>, activity: bool, channel: &str) -> anyhow::Result<()> {
+        let g = a.guild_id;
+        let Some(channel_id) = snowflake(channel)
+            .map(ChannelId::new)
+            .filter(|id| ctx.cache.guild(g).is_some_and(|guild| guild.channels.get(id).is_some_and(|c| c.kind == ChannelType::Text)))
+        else {
+            return a.update(ctx, self.view(ctx, g, "logs")?.content(Some("That channel no longer exists.".into()))).await;
+        };
+        let (key, what, title) = if activity {
+            ("log_channel_id", "ticket activity logs", "Ticket Log Channel Changed")
+        } else {
+            ("transcript_channel_id", "closed-ticket transcripts", "Ticket Transcript Channel Changed")
+        };
+        let confirm = serde_json::json!({
+            "embeds": [CreateEmbed::new().color(COLOR).title("Kori Tickets").description(format!("Kori will post {what} in this channel. Set by <@{}>.", a.user.id))],
+            "allowed_mentions": {"parse": []},
+        });
+        let notice = match ctx.http.send_message(channel_id, vec![], &confirm).await {
+            Ok(_) => {
+                self.repo.update_setting(&g.to_string(), key, rusqlite::types::Value::Text(channel_id.to_string()))?;
+                self.audit_configuration(ctx, a, title, vec![("Channel", format!("<#{channel_id}>"))]);
+                format!("🟢 Kori will post {what} in <#{channel_id}>.")
+            }
+            Err(error) => {
+                log_discord_error("ticket.logs.set", &error.into(), ctx! {"guildId" => g.to_string(), "channelId" => channel_id.to_string()});
+                format!("🔴 Not saved: Kori could not post in <#{channel_id}>. Give it View Channel, Send Messages, Embed Links and Attach Files there.")
+            }
+        };
+        a.update(ctx, self.view(ctx, g, "logs")?.content(Some(notice))).await
+    }
+
+    fn log_lines(&self, guild_id: GuildId, s: &GuildSettings) -> (String, String) {
+        let (operator_log, operator_transcripts) = self.tickets.operator_logs(guild_id);
+        let line = |channel: &Option<String>, operator: bool| match channel {
+            Some(id) => format!("<#{id}>"),
+            None if operator => "🟢 Bot owner's log webhook".into(),
+            None => "⚪ Not set".into(),
+        };
+        (line(&s.log_channel_id, operator_log), line(&s.transcript_channel_id, operator_transcripts))
+    }
+
     async fn send_panel(&self, ctx: &Context, a: &Actor<'_>, channel: &str) -> anyhow::Result<()> {
         let g = a.guild_id;
         let gs = g.to_string();
@@ -600,9 +651,10 @@ impl TicketUi {
             }
             list
         };
+        let (log_line, transcript_line) = self.log_lines(guild_id, &s);
         let type_list = if types.is_empty() { "⚪ None — single **Open Ticket** button".to_string() } else { types.iter().map(type_line).collect::<Vec<_>>().join(", ") };
         let description = format!(
-            "Managing **{}**\n🟢 **Kori** online • Uptime: {}\n\n**Status**\n{}\n\n**Ticket Category**\n{}\n\n**Staff Roles** ({})\n{staff_list}\n\n**Ticket Types** ({})\n{type_list}\n\n**Panel**\n**{}** — {}\n\n**Ticket Welcome**\n**{}** — pings {}\n\n**Open Tickets**\n{open}",
+            "Managing **{}**\n🟢 **Kori** online • Uptime: {}\n\n**Status**\n{}\n\n**Ticket Category**\n{}\n\n**Staff Roles** ({})\n{staff_list}\n\n**Ticket Types** ({})\n{type_list}\n\n**Panel**\n**{}** — {}\n\n**Ticket Welcome**\n**{}** — pings {}\n\n**Logs**\nActivity: {log_line} • Transcripts: {transcript_line}\n\n**Open Tickets**\n{open}",
             ctx.cache.guild(guild_id).map(|g| g.name.clone()).unwrap_or_default(),
             (self.uptime)(),
             if s.tickets_enabled != 0 { "🟢 Enabled — members can open tickets" } else { "🔴 Disabled — new tickets are paused" },
@@ -622,7 +674,7 @@ impl TicketUi {
                 nav("types", guild_id, "Ticket Types"),
                 nav("panel", guild_id, "Panel"),
                 nav("welcome", guild_id, "Ticket Welcome"),
-            ]), row(vec![nav_styled("dashboard", guild_id, "Refresh", ButtonStyle::Secondary)])],
+            ]), row(vec![nav("logs", guild_id, "Logs"), nav_styled("dashboard", guild_id, "Refresh", ButtonStyle::Secondary)])],
         ))
     }
 
@@ -745,6 +797,23 @@ impl TicketUi {
                     ],
                 ))
             }
+            "logs" => {
+                let s = self.repo.settings(&gs)?;
+                let (log_line, transcript_line) = self.log_lines(g, &s);
+                let text = format!(
+                    "Kori posts this server's ticket activity (opened, claimed, members added or removed, closed, setup changes) and the `.txt` transcript of every closed ticket in channels you choose. They stay in this server. Transcripts contain every ticket message, so keep these channels private to staff. Members still get their own transcript by DM.\n\n**Activity Log**\n{log_line}\n\n**Transcripts**\n{transcript_line}"
+                );
+                Ok(View::embed(
+                    CreateEmbed::new().color(COLOR).title("Logs").description(text),
+                    vec![row(vec![
+                        act("logs", "pick", g, "Set Log Channel", ButtonStyle::Primary),
+                        act("logs", "pickt", g, "Set Transcript Channel", ButtonStyle::Primary),
+                        act("logs", "clear", g, "Clear Log", ButtonStyle::Secondary).disabled(s.log_channel_id.is_none()),
+                        act("logs", "cleart", g, "Clear Transcripts", ButtonStyle::Secondary).disabled(s.transcript_channel_id.is_none()),
+                        back(),
+                    ])],
+                ))
+            }
             _ => self.dashboard(ctx, g),
         }
     }
@@ -839,6 +908,41 @@ mod tests {
         assert!(reply(&h)["data"]["content"].as_str().unwrap().contains("was deleted"));
         assert!(h.repo.settings("1").unwrap().panel_message_id.is_none());
         assert!(h.repo.settings("1").unwrap().panel_title.is_none(), "reset to defaults");
+    }
+
+    #[tokio::test]
+    async fn log_channels_are_saved_only_after_kori_posts_there() {
+        let (h, bot) = harness().await;
+        let ctx = h.ctx();
+        // Kori cannot post there: nothing is saved and the admin is told why.
+        h.on("POST", "/channels/60/messages", 403, json!({"code": 50013, "message": "Missing Permissions"}));
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(1, 8, "ticketui:logset:x:1", 8, &["60"]))).await;
+        assert!(h.repo.settings("1").unwrap().log_channel_id.is_none());
+        assert!(reply(&h)["data"]["content"].as_str().unwrap().starts_with("🔴 Not saved"));
+
+        h.on("POST", "/channels/60/messages", 200, json!({"id": "900", "channel_id": "60", "author": crate::test_support::user_json(crate::test_support::BOT_ID),
+            "content": "", "timestamp": "2026-01-01T00:00:00.000Z", "edited_timestamp": null, "tts": false, "mention_everyone": false,
+            "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false, "type": 0}));
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(1, 8, "ticketui:logset:x:1", 8, &["60"]))).await;
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(1, 8, "ticketui:transcriptset:x:1", 8, &["60"]))).await;
+        let s = h.repo.settings("1").unwrap();
+        assert_eq!((s.log_channel_id.as_deref(), s.transcript_channel_id.as_deref()), (Some("60"), Some("60")));
+        let text = reply(&h)["data"]["embeds"][0]["description"].as_str().unwrap().to_string();
+        assert!(text.contains("**Activity Log**\n<#60>") && text.contains("**Transcripts**\n<#60>"), "{text}");
+
+        // Setup changes now land in the server's own log channel.
+        let mut waited = 0;
+        while !h.calls_to("POST", "/channels/60/messages").iter().any(|c| c.body["embeds"][0]["title"] == "Ticket Transcript Channel Changed") && waited < 100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            waited += 1;
+        }
+        assert!(waited < 100, "configuration change logged in the server's channel");
+
+        bot.on_interaction(&ctx, &Interaction::Component(h.button(1, 8, "ticketui:logs:clear:1"))).await;
+        assert!(h.repo.settings("1").unwrap().log_channel_id.is_none());
+        // Non-admins cannot redirect a server's logs.
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(1, 9, "ticketui:logset:x:1", 8, &["60"]))).await;
+        assert!(h.repo.settings("1").unwrap().log_channel_id.is_none());
     }
 
     #[tokio::test]

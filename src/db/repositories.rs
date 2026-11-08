@@ -24,6 +24,9 @@ pub struct GuildSettings {
     pub welcome_description: Option<String>,
     pub welcome_ping_opener: i64,
     pub welcome_ping_staff: i64,
+    /// This server's own log and transcript channels; `None` = not set.
+    pub log_channel_id: Option<String>,
+    pub transcript_channel_id: Option<String>,
 }
 /// The editable panel embed. `None` fields fall back to Kori's defaults.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -134,9 +137,12 @@ impl KoriRepository {
         ensure_guild(&c, guild_id)?;
         get(&c, "SELECT * FROM guild_settings WHERE guild_id = ?", params![guild_id])?.ok_or_else(|| anyhow!("guild settings missing"))
     }
-    /// key: "tickets_enabled" | "ticket_category_id" | "welcome_ping_opener" | "welcome_ping_staff"
+    /// key: "tickets_enabled" | "ticket_category_id" | "welcome_ping_opener" | "welcome_ping_staff" | "log_channel_id" | "transcript_channel_id"
     pub fn update_setting(&self, guild_id: &str, key: &str, value: Value) -> Result<()> {
-        let key = checked(key, &["tickets_enabled", "ticket_category_id", "welcome_ping_opener", "welcome_ping_staff"])?;
+        let key = checked(
+            key,
+            &["tickets_enabled", "ticket_category_id", "welcome_ping_opener", "welcome_ping_staff", "log_channel_id", "transcript_channel_id"],
+        )?;
         let c = self.conn();
         ensure_guild(&c, guild_id)?;
         c.execute(&format!("UPDATE guild_settings SET {key} = ?, updated_at = ? WHERE guild_id = ?"), params![value, now(), guild_id])?;

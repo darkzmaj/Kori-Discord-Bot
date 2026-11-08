@@ -8,6 +8,7 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../db/migrations/0001.sql")),
     (2, include_str!("../../db/migrations/0002.sql")),
     (3, include_str!("../../db/migrations/0003.sql")),
+    (4, include_str!("../../db/migrations/0004.sql")),
 ];
 
 pub fn now() -> String {

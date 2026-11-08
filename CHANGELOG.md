@@ -12,6 +12,8 @@ First release of Kori, the ticket and support bot.
   whenever the embed or the ticket types change; no resending. A ticket-type selector, or a single Open Ticket button.
 - Editable ticket welcome message (title and description, with `{user}` and `{type}` placeholders) and switches
   for pinging the ticket creator and all staff roles.
+- Per-server log and transcript channels in `/ticket` → **Logs**. A server's ticket activity and transcripts stay
+  in that server; the owner's `.env` webhooks only take bot health and their own server's events.
 - `/ticket` overview shows the whole current setup; every existing setting can be edited (types included).
 - Private ticket channels named `type-username` (or `ticket-username`), hidden from `@everyone`, with a
   5-second message cooldown and a strict permission set (view, send, history, attach, embed links,

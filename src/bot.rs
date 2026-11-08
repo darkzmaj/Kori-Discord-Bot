@@ -113,7 +113,6 @@ impl KoriBot {
             repo.clone(),
             tickets.clone(),
             move || compact_uptime(uptime_start.lock().unwrap().elapsed().as_millis()),
-            Some(audit.clone()),
         ));
         Self {
             discord,
@@ -181,6 +180,11 @@ impl KoriBot {
         }
         if settings.panel_channel_id.as_deref() == Some(channel.as_str()) {
             self.repo.set_panel_message(&guild, None)?;
+        }
+        for (key, configured) in [("log_channel_id", &settings.log_channel_id), ("transcript_channel_id", &settings.transcript_channel_id)] {
+            if configured.as_deref() == Some(channel.as_str()) {
+                self.repo.update_setting(&guild, key, rusqlite::types::Value::Null)?;
+            }
         }
         self.tickets.on_channel_delete(guild_id, channel_id)?;
         Ok(())

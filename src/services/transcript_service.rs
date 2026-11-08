@@ -77,6 +77,11 @@ impl TranscriptLogService {
         self.config.is_some() && self.validated.load(Ordering::SeqCst)
     }
 
+    /// The operator's transcript webhook only takes transcripts from its own server.
+    pub fn enabled_for(&self, guild_id: &str) -> bool {
+        self.enabled() && self.config.as_ref().is_some_and(|c| c.guild_id == guild_id)
+    }
+
     /// Called after ready: the webhook must belong to the configured guild and channel.
     pub async fn initialize(&self) {
         let Some(config) = &self.config else { return };
@@ -104,9 +109,9 @@ impl TranscriptLogService {
         }
     }
 
-    /// Sends one transcript file with its summary embed. False when disabled or every attempt failed.
-    pub async fn deliver(&self, embed: Value, filename: &str, data: &[u8]) -> bool {
-        let Some(config) = self.config.as_ref().filter(|_| self.enabled()) else { return false };
+    /// Sends one transcript file with its summary embed. False when disabled, for another server, or every attempt failed.
+    pub async fn deliver(&self, guild_id: &str, embed: Value, filename: &str, data: &[u8]) -> bool {
+        let Some(config) = self.config.as_ref().filter(|_| self.enabled_for(guild_id)) else { return false };
         let payload_json = json!({
             "embeds": [embed],
             "allowed_mentions": {"parse": [], "users": [], "roles": [], "replied_user": false},
@@ -344,11 +349,13 @@ mod tests {
         };
         let wrong = TranscriptLogService::with_transport(config("323456789012345678"), transport.clone());
         wrong.initialize().await;
-        assert!(!wrong.deliver(json!({}), "t.txt", b"x").await, "webhook in another channel is refused");
+        let g = "123456789012345678";
+        assert!(!wrong.deliver(g, json!({}), "t.txt", b"x").await, "webhook in another channel is refused");
         let service = TranscriptLogService::with_transport(config("223456789012345678"), transport);
-        assert!(!service.deliver(json!({}), "t.txt", b"x").await, "nothing is sent before verification");
+        assert!(!service.deliver(g, json!({}), "t.txt", b"x").await, "nothing is sent before verification");
         service.initialize().await;
-        assert!(service.deliver(json!({"title": "t"}), "ticket.txt", b"body").await);
+        assert!(!service.deliver("999999999999999999", json!({}), "t.txt", b"x").await, "another server's transcript never reaches the operator");
+        assert!(service.deliver(g, json!({"title": "t"}), "ticket.txt", b"body").await);
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].filename, "ticket.txt");

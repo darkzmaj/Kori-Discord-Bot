@@ -19,7 +19,7 @@ use crate::ctx;
 use crate::db::repositories::{GuildSettings, KoriRepository, PanelEmbed, Ticket, TicketType};
 use crate::discord::Discord;
 use crate::logger::{self, log_discord_error};
-use crate::services::audit_log_service::{AuditEvent, AuditLogService, AuditSubject};
+use crate::services::audit_log_service::{render_event, AuditEvent, AuditLogService, AuditSubject};
 use crate::services::locks::KeyedLock;
 use crate::services::transcript_service::{render_transcript, summary_embed, TranscriptLogService, TranscriptMeta, MAX_TRANSCRIPT_MESSAGES};
 
@@ -354,10 +354,20 @@ impl TicketService {
         TicketService { repo, discord, audit, transcripts, opening: KeyedLock::default(), recent: Mutex::default() }
     }
 
+    /// Logs one event for `guild_id`: see [`route_log`].
+    pub fn log(&self, guild_id: GuildId, event: AuditEvent) {
+        route_log(&self.repo, &self.discord, self.audit.as_deref(), guild_id, event);
+    }
+
+    /// Whether the operator's `.env` webhooks cover this server: (main log, transcripts).
+    pub fn operator_logs(&self, guild_id: GuildId) -> (bool, bool) {
+        let gs = guild_id.to_string();
+        (self.audit.as_ref().is_some_and(|a| a.covers(&gs)), self.transcripts.enabled_for(&gs))
+    }
+
     fn record(&self, title: &str, color: &str, guild_id: GuildId, actor: Option<&User>, details: Vec<(&str, String)>) {
-        let Some(audit) = &self.audit else { return };
         let guild_name = self.discord.cache.guild(guild_id).map(|g| g.name.clone());
-        audit.record(AuditEvent {
+        self.log(guild_id, AuditEvent {
             title: title.into(),
             category: "Tickets".into(),
             color: color.into(),
@@ -987,6 +997,28 @@ async fn fetch_messages(http: &Arc<Http>, channel: ChannelId) -> (Vec<Message>, 
     (all, truncated)
 }
 
+/// Posts a server's event to the log channel it chose in `/ticket`. Without one, the event goes to the operator's
+/// log webhook, which only accepts the operator's own server (and bot health).
+pub fn route_log(repo: &Arc<KoriRepository>, discord: &Discord, audit: Option<&AuditLogService>, guild_id: GuildId, event: AuditEvent) {
+    let gs = guild_id.to_string();
+    let Some(channel) = repo.settings(&gs).ok().and_then(|s| s.log_channel_id).and_then(|c| snowflake(&c)).map(ChannelId::new) else {
+        if let Some(audit) = audit {
+            audit.record(event);
+        }
+        return;
+    };
+    let body = serde_json::json!({"embeds": [render_event(event)], "allowed_mentions": {"parse": []}});
+    let (http, repo) = (discord.http.clone(), repo.clone());
+    tokio::spawn(async move {
+        if let Err(error) = http.send_message(channel, vec![], &body).await {
+            if logger::discord_code(&error) == Some(10003) {
+                let _ = repo.update_setting(&gs, "log_channel_id", rusqlite::types::Value::Null);
+            }
+            log_discord_error("ticket.log.channel", &error.into(), ctx! {"guildId" => gs, "channelId" => channel.to_string()});
+        }
+    });
+}
+
 struct Teardown {
     repo: Arc<KoriRepository>,
     discord: Discord,
@@ -1053,7 +1085,22 @@ impl Teardown {
         let filename = format!("transcript-{channel_name}.txt");
         let embed = summary_embed(&meta, &self.ticket.opener_id, &self.closer.id.to_string(), self.ticket.claimed_by_id.as_deref(), &ids);
 
-        let logged = self.transcripts.deliver(embed.clone(), &filename, text.as_bytes()).await;
+        let gs = self.guild_id.to_string();
+        // The server's own transcript channel; otherwise the operator's webhook (own server only).
+        let own = self.repo.settings(&gs).ok().and_then(|s| s.transcript_channel_id).and_then(|c| snowflake(&c)).map(ChannelId::new);
+        let (configured, logged) = match own {
+            Some(channel) => {
+                let body = serde_json::json!({"embeds": [embed.clone()], "allowed_mentions": {"parse": []}});
+                let sent = http.send_message(channel, vec![CreateAttachment::bytes(text.as_bytes().to_vec(), filename.clone())], &body).await;
+                if let Err(error) = &sent {
+                    if logger::discord_code(error) == Some(10003) {
+                        let _ = self.repo.update_setting(&gs, "transcript_channel_id", rusqlite::types::Value::Null);
+                    }
+                }
+                (true, sent.map_err(|e| log_discord_error("ticket.transcript.channel", &e.into(), ctx! {"guildId" => gs.clone()})).is_ok())
+            }
+            None => (self.transcripts.enabled_for(&gs), self.transcripts.deliver(&gs, embed.clone(), &filename, text.as_bytes()).await),
+        };
         let dm = async {
             let opener = UserId::new(snowflake(&self.ticket.opener_id).ok_or_else(|| anyhow::anyhow!("invalid opener"))?);
             let dm = opener.create_dm_channel(http).await?;
@@ -1069,12 +1116,12 @@ impl Teardown {
                 false
             }
         };
-        if let Some(audit) = &self.audit {
+        {
             let guild_name = meta.guild_name.clone();
-            audit.record(AuditEvent {
+            route_log(&self.repo, &self.discord, self.audit.as_deref(), self.guild_id, AuditEvent {
                 title: "Ticket Deleted".into(),
                 category: "Tickets".into(),
-                color: if deleted && dm_sent && (logged || !self.transcripts.enabled()) { "info".into() } else { "warning".into() },
+                color: if deleted && dm_sent && (logged || !configured) { "info".into() } else { "warning".into() },
                 guild: Some(AuditSubject::named(self.guild_id.to_string(), guild_name)),
                 actor: Some(AuditSubject::named(self.closer.id.to_string(), self.closer.tag())),
                 details: vec![
@@ -1083,7 +1130,7 @@ impl Teardown {
                     ("Channel Deleted".into(), if deleted { "Yes" } else { "Failed — delete it manually" }.into()),
                     (
                         "Transcript Log".into(),
-                        if logged { "Sent" } else if self.transcripts.enabled() { "Failed" } else { "Not configured" }.into(),
+                        if logged { "Sent" } else if configured { "Failed" } else { "Not configured" }.into(),
                     ),
                     ("Opener DM".into(), if dm_sent { "Delivered" } else { "Not delivered (DMs closed?)" }.into()),
                 ],
@@ -1443,6 +1490,8 @@ mod tests {
             .unwrap();
         h.repo.claim_ticket("1", &c.to_string(), Some("6"), None).unwrap();
         h.repo.add_ticket_member(&c.to_string(), "9", "6").unwrap();
+        h.repo.update_setting("1", "transcript_channel_id", rusqlite::types::Value::Text("60".into())).unwrap();
+        h.repo.update_setting("1", "log_channel_id", rusqlite::types::Value::Text("61".into())).unwrap();
         let message = |id: u64, author: u64, content: &str| {
             json!({"id": id.to_string(), "channel_id": c.to_string(), "author": user_json(author), "content": content,
                 "timestamp": "2026-11-08T10:00:00.000Z", "edited_timestamp": null, "tts": false, "mention_everyone": false,
@@ -1456,15 +1505,21 @@ mod tests {
         let notice = h.replies().last().unwrap()["data"]["embeds"][0]["description"].as_str().unwrap().to_string();
         assert!(notice.contains("Closed by <@6>") && notice.contains("**Reason:** Refund issued"), "{notice}");
 
+        let deleted_log = |h: &Harness| h.calls_to("POST", "/channels/61/messages").into_iter().any(|call| call.body["embeds"][0]["title"] == "Ticket Deleted");
         let mut waited = 0;
-        while h.calls_to("POST", "/channels/*/messages").iter().all(|call| call.path == format!("/channels/{c}/messages")) && waited < 100 {
+        while !(h.calls_to("POST", "/users/@me/channels").len() == 1 && deleted_log(&h)) && waited < 100 {
             tokio::time::sleep(Duration::from_millis(20)).await;
             waited += 1;
         }
         assert_eq!(h.calls_to("DELETE", &format!("/channels/{c}")).len(), 1, "channel deleted");
         assert_eq!(h.calls_to("POST", "/users/@me/channels").len(), 1, "DM channel opened with the opener");
-        let dm = h.calls_to("POST", "/channels/*/messages").into_iter().find(|call| call.path != format!("/channels/{c}/messages")).expect("DM sent");
+        let own = [format!("/channels/{c}/messages"), "/channels/60/messages".into(), "/channels/61/messages".into()];
+        let dm = h.calls_to("POST", "/channels/*/messages").into_iter().find(|call| !own.contains(&call.path)).expect("DM sent");
         assert!(dm.body.is_null(), "the DM is multipart: it carries the transcript file");
+        let transcript = h.calls_to("POST", "/channels/60/messages");
+        assert_eq!(transcript.len(), 1, "transcript posted in the server's own transcript channel");
+        assert!(transcript[0].body.is_null(), "with the .txt attached");
+        assert!(deleted_log(&h), "the server's own log channel records the deletion");
         assert!(h.repo.ticket("1", &c.to_string()).unwrap().is_none());
     }
 
