@@ -35,5 +35,7 @@ USER kori
 
 VOLUME ["/app/data"]
 
-# Discord bots are outbound-gateway only; no port is exposed.
+# Kori only connects out to the Discord gateway. 8080 is the optional health check,
+# listening only when KORI_HEALTH_ADDR is set (for example 0.0.0.0:8080).
+EXPOSE 8080
 CMD ["kori"]

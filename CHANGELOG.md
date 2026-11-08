@@ -2,6 +2,12 @@
 
 All notable changes to Kori are documented here. Kori follows [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Optional health check for uptime monitors (`KORI_HEALTH_ADDR`, for example `0.0.0.0:8080`): `GET /health`
+  (or `/`, for proxies that strip a path prefix) answers `ok` (200) only while Kori is connected to Discord, and
+  `disconnected` (503) otherwise. Off when unset. The Docker image and compose file expose port 8080.
+
 ## 1.0.0 — 2026-11-08
 
 First release of Kori, the ticket and support bot.

@@ -21,9 +21,14 @@ services:
       TRANSCRIPT_WEBHOOK_URL: ${TRANSCRIPT_WEBHOOK_URL:-}
       TRANSCRIPT_GUILD_ID: ${TRANSCRIPT_GUILD_ID:-}
       TRANSCRIPT_CHANNEL_ID: ${TRANSCRIPT_CHANNEL_ID:-}
+      # Optional health check for uptime monitors, for example 0.0.0.0:8080 (see .env.example).
+      KORI_HEALTH_ADDR: ${KORI_HEALTH_ADDR:-}
     volumes:
       - kori-data:/app/data
-    # No inbound ports: this is an outbound-only Discord gateway connection.
+    # No published ports. With KORI_HEALTH_ADDR set, a reverse proxy can reach the
+    # health check on the internal network; nothing else listens.
+    expose:
+      - "8080"
     # No meaningful process-external healthcheck exists for a gateway-only bot;
     # `restart: unless-stopped` recovers from crashes via the container exiting.
     # Security hardening
