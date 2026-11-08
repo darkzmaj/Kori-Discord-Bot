@@ -1,0 +1,50 @@
+[
+  {
+    "type": 1,
+    "name": "ticket",
+    "description": "𝗔𝗱𝗺𝗶𝗻 Open Kori Tickets.",
+    "default_member_permissions": "8",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": []
+  },
+  {
+    "type": 1,
+    "name": "add",
+    "description": "𝗦𝘁𝗮𝗳𝗳 Add a member to this ticket.",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": [
+      { "type": 6, "name": "user", "description": "Member.", "required": true }
+    ]
+  },
+  {
+    "type": 1,
+    "name": "remove",
+    "description": "𝗦𝘁𝗮𝗳𝗳 Remove a member from this ticket.",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": [
+      { "type": 6, "name": "user", "description": "Member.", "required": true }
+    ]
+  },
+  {
+    "type": 1,
+    "name": "close",
+    "description": "𝗧𝗶𝗰𝗸𝗲𝘁 Close this ticket.",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": [
+      { "type": 3, "name": "reason", "description": "Optional reason, shown in the transcript.", "required": false, "max_length": 500 }
+    ]
+  },
+  {
+    "type": 1,
+    "name": "reclaim",
+    "description": "𝗔𝗱𝗺𝗶𝗻 Take over this ticket.",
+    "default_member_permissions": "8",
+    "integration_types": [0],
+    "contexts": [0],
+    "options": []
+  }
+]

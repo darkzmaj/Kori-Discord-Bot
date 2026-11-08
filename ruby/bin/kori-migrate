@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/kori'
+
+Kori::Config.load_dotenv
+Kori::Database.open(Kori::Config.database_path).close
+puts 'Migrations completed.'

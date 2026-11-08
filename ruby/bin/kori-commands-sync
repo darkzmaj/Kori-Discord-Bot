@@ -1,0 +1,25 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/kori'
+
+begin
+  Kori::Config.load_dotenv
+  if ARGV.include?('--dry-run')
+    Kori::Commands.assert_schema!
+    puts "Command synchronization dry run: schema=#{Kori::Commands.fingerprint[0, 12]} commands=#{Kori::Commands.names.join(',')}"
+    exit 0
+  end
+  Kori::Config.require!
+  db = Kori::Database.open(Kori::Config.database_path)
+  rest = Kori::DiscordRest.new(Kori::Config.token)
+  result = Kori::CommandSync.new(rest, db, Kori::Config.application_id).synchronize(force_cleanup: true)
+  puts "Command synchronization complete: application=#{result[:application_id]} schema=#{result[:fingerprint][0, 12]} " \
+       "cleaned=#{result[:cleaned]} failed=#{result[:failed]}"
+  exit(result[:failed].zero? ? 0 : 1)
+rescue StandardError => e
+  warn "Command synchronization failed: #{e.message}"
+  exit 1
+ensure
+  db&.close
+end

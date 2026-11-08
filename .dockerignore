@@ -1,0 +1,14 @@
+target
+data
+coverage
+.bundle
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+*.md
+docs
+install.sh
+install.ps1
+.github

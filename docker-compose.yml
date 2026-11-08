@@ -1,0 +1,51 @@
+services:
+  kori:
+    # Prebuilt image from GitHub Container Registry; `docker compose build` builds it from source instead.
+    image: ghcr.io/darkzmaj/kori:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kori
+    restart: unless-stopped
+    # Values come from .env next to this file (created by the installer) or from your platform's
+    # environment settings (Coolify, Portainer, ...). See .env.example for what each one does.
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?Set DISCORD_TOKEN in .env}
+      DATABASE_PATH: /app/data/kori.sqlite
+      APPLICATION_ID: ${APPLICATION_ID:-}
+      DIAGNOSTIC_GUILD_ID: ${DIAGNOSTIC_GUILD_ID:-}
+      DIAGNOSTIC_USER_ID: ${DIAGNOSTIC_USER_ID:-}
+      LOG_WEBHOOK_URL: ${LOG_WEBHOOK_URL:-}
+      LOG_GUILD_ID: ${LOG_GUILD_ID:-}
+      LOG_CHANNEL_ID: ${LOG_CHANNEL_ID:-}
+      TRANSCRIPT_WEBHOOK_URL: ${TRANSCRIPT_WEBHOOK_URL:-}
+      TRANSCRIPT_GUILD_ID: ${TRANSCRIPT_GUILD_ID:-}
+      TRANSCRIPT_CHANNEL_ID: ${TRANSCRIPT_CHANNEL_ID:-}
+    volumes:
+      - kori-data:/app/data
+    # No inbound ports: this is an outbound-only Discord gateway connection.
+    # No meaningful process-external healthcheck exists for a gateway-only bot;
+    # `restart: unless-stopped` recovers from crashes via the container exiting.
+    # Security hardening
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+volumes:
+  kori-data:

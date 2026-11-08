@@ -1,0 +1,20 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/kori'
+
+begin
+  Kori::Config.load_dotenv
+  Kori::Config.require!
+  db = Kori::Database.open(Kori::Config.database_path)
+  rest = Kori::DiscordRest.new(Kori::Config.token)
+  report = Kori::CommandSync.new(rest, db, Kori::Config.application_id)
+                            .inspect_live(Kori::Config.diagnostic_guild_id, Kori::Config.diagnostic_user_id)
+  puts 'KORI COMMAND DIAGNOSTIC'
+  puts JSON.pretty_generate(report)
+rescue StandardError => e
+  warn "Command inspection failed: #{e.message}"
+  exit 1
+ensure
+  db&.close
+end

@@ -1,0 +1,10 @@
+target/
+data/
+coverage/
+.bundle/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.db
