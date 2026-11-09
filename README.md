@@ -62,6 +62,7 @@ Everything ticket-related is configured per server with `/ticket`. Operator-leve
 | `LOG_WEBHOOK_URL`, `LOG_GUILD_ID`, `LOG_CHANNEL_ID` | no | — | Bot owner's log: bot health for every server, plus ticket activity from `LOG_GUILD_ID` only. |
 | `TRANSCRIPT_WEBHOOK_URL`, `TRANSCRIPT_GUILD_ID`, `TRANSCRIPT_CHANNEL_ID` | no | — | Bot owner's transcript log: transcripts from `TRANSCRIPT_GUILD_ID` only. |
 | `DIAGNOSTIC_GUILD_ID`, `DIAGNOSTIC_USER_ID` | no | — | Extra detail for `rake commands:inspect`. |
+| `KORI_HEALTH_ADDR` | no | off | Health check for uptime monitors, for example `0.0.0.0:8080`. `GET /health` (or `/`) answers `ok` (200) only while Kori is connected to Discord, `disconnected` (503) otherwise. |
 
 Kori checks its configuration at startup. If something is wrong, such as a missing token or a log with only some of its three values set, it exits with a clear message.
 
@@ -142,7 +143,7 @@ Back up the SQLite database while the process is stopped, or use SQLite's online
 
 `Dockerfile` builds a multi-stage, non-root production image: a Rust build stage, then a Ruby 3.4 slim runtime with the `kori` binary and the Ruby tooling. `docker-compose.yml` runs it with a named volume for `/app/data`, a read-only root filesystem, dropped capabilities and `no-new-privileges`. Migrations run automatically on startup and slash commands resynchronize on ready, so no extra setup is needed beyond the environment variables.
 
-In Coolify, create a new resource from this repository with **Docker Compose** as the build pack. Then set at least `DISCORD_TOKEN` (and optionally `APPLICATION_ID` and the logging variables) under Environment Variables. Do not set `DATABASE_PATH`. There is no HTTP port to expose: Kori only makes outbound connections to the Discord gateway.
+In Coolify, create a new resource from this repository with **Docker Compose** as the build pack. Then set at least `DISCORD_TOKEN` (and optionally `APPLICATION_ID` and the logging variables) under Environment Variables. Do not set `DATABASE_PATH`. Kori only makes outbound connections to the Discord gateway, so no port is needed. For an uptime monitor, set `KORI_HEALTH_ADDR=0.0.0.0:8080` and route a domain or path to container port 8080. The check also answers at `/`, so a proxy that strips its path prefix (such as `https://example.com/kori-health`) works; have the monitor look for the keyword `ok`.
 
 Inside the container, the tooling is available as `bundle exec rake commands:sync`, `commands:inspect` and `migrate`.
 
