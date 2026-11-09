@@ -44,7 +44,7 @@ async fn run(config: config::Config) -> anyhow::Result<()> {
         .event_handler(Handler { bot: slot.clone() })
         .await?;
     let discord = discord::Discord { http: client.http.clone(), cache: client.cache.clone() };
-    let bot = Arc::new(KoriBot::new(repo, config.application_id.clone(), &config, discord));
+    let bot = Arc::new(KoriBot::new(repo, config.application_id.clone(), discord));
     let _ = slot.set(bot.clone());
     if let Some(addr) = std::env::var("KORI_HEALTH_ADDR").ok().filter(|v| !v.trim().is_empty()) {
         let addr: std::net::SocketAddr = addr.trim().parse()?;

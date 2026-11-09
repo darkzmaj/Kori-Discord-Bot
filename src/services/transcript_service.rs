@@ -1,141 +1,12 @@
-//! Ticket transcripts: renders a closed ticket as plain text and delivers it, as a `.txt` file, to the
-//! operator's transcript log webhook. The webhook's guild and channel are verified before anything is sent.
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
+//! Ticket transcripts: renders a closed ticket as plain text. The ticket service posts it, as a `.txt` file, to the
+//! transcript channel chosen in `/ticket` → **Logs**, and DMs it to the opener.
 use serde_json::{json, Value};
 use serenity::all::Message;
 
-use crate::config::LogDestination;
-use crate::logger;
-use crate::services::audit_log_service::{retry_delay_ms, validate_audit_log_config, BoxFut, ValidAuditLogConfig, WebhookResponse};
-
-/// Discord's attachment limit for webhooks and DMs is 10 MiB; stay well under it.
+/// Discord's attachment limit is 10 MiB; stay well under it.
 pub const MAX_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
 /// Tickets longer than this are transcribed up to the limit, newest messages last.
 pub const MAX_TRANSCRIPT_MESSAGES: usize = 10_000;
-const RETRIES: u32 = 3;
-
-/// One file upload with its message payload.
-#[derive(Clone, Debug)]
-pub struct Upload {
-    pub payload_json: String,
-    pub filename: String,
-    pub data: Vec<u8>,
-}
-
-/// `(url, None)` = GET (validation), `(url, Some(upload))` = multipart POST (delivery).
-pub type UploadTransport = Arc<dyn Fn(String, Option<Upload>) -> BoxFut<anyhow::Result<WebhookResponse>> + Send + Sync>;
-
-pub fn reqwest_upload_transport(client: reqwest::Client) -> UploadTransport {
-    Arc::new(move |url, upload| {
-        let client = client.clone();
-        Box::pin(async move {
-            let request = match upload {
-                None => client.get(&url).timeout(Duration::from_secs(5)),
-                Some(upload) => {
-                    let file = reqwest::multipart::Part::bytes(upload.data).file_name(upload.filename).mime_str("text/plain; charset=utf-8")?;
-                    let form = reqwest::multipart::Form::new().text("payload_json", upload.payload_json).part("files[0]", file);
-                    client.post(&url).multipart(form).timeout(Duration::from_secs(30))
-                }
-            };
-            let response = request.send().await?;
-            let status = response.status().as_u16();
-            let retry_after = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(String::from);
-            let body = response.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-            Ok(WebhookResponse { status, retry_after, body })
-        })
-    })
-}
-
-pub struct TranscriptLogService {
-    config: Option<ValidAuditLogConfig>,
-    validated: AtomicBool,
-    request: UploadTransport,
-}
-
-impl TranscriptLogService {
-    pub fn new(configured: LogDestination, client: reqwest::Client) -> Self {
-        Self::with_transport(configured, reqwest_upload_transport(client))
-    }
-
-    pub fn with_transport(configured: LogDestination, request: UploadTransport) -> Self {
-        let config = match validate_audit_log_config(&configured) {
-            Ok(config) => Some(config),
-            Err(reason) => {
-                if reason != "not configured" {
-                    logger::warn("[transcripts] transcript logging disabled", crate::ctx! {"reason" => reason});
-                }
-                None
-            }
-        };
-        Self { config, validated: AtomicBool::new(false), request }
-    }
-
-    pub fn enabled(&self) -> bool {
-        self.config.is_some() && self.validated.load(Ordering::SeqCst)
-    }
-
-    /// The operator's transcript webhook only takes transcripts from its own server.
-    pub fn enabled_for(&self, guild_id: &str) -> bool {
-        self.enabled() && self.config.as_ref().is_some_and(|c| c.guild_id == guild_id)
-    }
-
-    /// Called after ready: the webhook must belong to the configured guild and channel.
-    pub async fn initialize(&self) {
-        let Some(config) = &self.config else { return };
-        for attempt in 0..=RETRIES {
-            match (self.request)(config.webhook_url.clone(), None).await {
-                Ok(response) if response.ok() => {
-                    let webhook: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
-                    let matches = webhook["guild_id"].as_str() == Some(config.guild_id.as_str())
-                        && webhook["channel_id"].as_str() == Some(config.channel_id.as_str());
-                    if matches {
-                        self.validated.store(true, Ordering::SeqCst);
-                        logger::info("[transcripts] transcript logging enabled", crate::ctx! {"guildId" => config.guild_id, "channelId" => config.channel_id});
-                    } else {
-                        logger::warn("[transcripts] webhook does not belong to TRANSCRIPT_GUILD_ID / TRANSCRIPT_CHANNEL_ID; transcript logging disabled", crate::ctx! {});
-                    }
-                    return;
-                }
-                Ok(response) if response.status != 429 && response.status < 500 => {
-                    logger::warn("[transcripts] webhook unavailable; transcript logging disabled", crate::ctx! {"status" => response.status});
-                    return;
-                }
-                _ if attempt < RETRIES => tokio::time::sleep(Duration::from_millis(2_000 * (attempt as u64 + 1))).await,
-                _ => logger::warn("[transcripts] webhook validation failed after retries", crate::ctx! {}),
-            }
-        }
-    }
-
-    /// Sends one transcript file with its summary embed. False when disabled, for another server, or every attempt failed.
-    pub async fn deliver(&self, guild_id: &str, embed: Value, filename: &str, data: &[u8]) -> bool {
-        let Some(config) = self.config.as_ref().filter(|_| self.enabled_for(guild_id)) else { return false };
-        let payload_json = json!({
-            "embeds": [embed],
-            "allowed_mentions": {"parse": [], "users": [], "roles": [], "replied_user": false},
-        })
-        .to_string();
-        let upload = Upload { payload_json, filename: filename.to_string(), data: data.to_vec() };
-        for attempt in 0..=RETRIES {
-            match (self.request)(config.webhook_url.clone(), Some(upload.clone())).await {
-                Ok(response) if response.ok() => return true,
-                Ok(response) if response.status != 429 && response.status < 500 => {
-                    logger::warn("[transcripts] transcript delivery rejected", crate::ctx! {"status" => response.status});
-                    return false;
-                }
-                Ok(response) if attempt < RETRIES => {
-                    tokio::time::sleep(Duration::from_millis(retry_delay_ms(response.retry_after.as_deref(), attempt))).await
-                }
-                Err(_) if attempt < RETRIES => tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await,
-                _ => {}
-            }
-        }
-        logger::warn("[transcripts] transcript delivery retries exhausted", crate::ctx! {});
-        false
-    }
-}
 
 /// Everything the transcript header and summaries show about a closed ticket.
 #[derive(Clone, Debug, Default)]
@@ -254,7 +125,6 @@ pub fn summary_embed(meta: &TranscriptMeta, opener_id: &str, closer_id: &str, cl
 mod tests {
     use super::*;
     use crate::test_support::user_json;
-    use std::sync::Mutex;
 
     fn message(id: u64, author: u64, content: &str) -> Message {
         serde_json::from_value(json!({
@@ -323,42 +193,5 @@ mod tests {
         assert_eq!(field("Reason"), "Resolved");
         assert_eq!(field("Participants"), "<@5>, <@6>, <@7>");
         assert_eq!(field("Created"), format!("<t:{}:F>", meta().created_at.timestamp()));
-    }
-
-    #[tokio::test]
-    async fn delivers_only_to_a_verified_destination() {
-        let sent = Arc::new(Mutex::new(Vec::<Upload>::new()));
-        let sink = sent.clone();
-        let transport: UploadTransport = Arc::new(move |_url, upload| {
-            let sink = sink.clone();
-            Box::pin(async move {
-                let body = match upload {
-                    None => json!({"guild_id": "123456789012345678", "channel_id": "223456789012345678"}).to_string(),
-                    Some(upload) => {
-                        sink.lock().unwrap().push(upload);
-                        String::new()
-                    }
-                };
-                Ok(WebhookResponse { status: 200, retry_after: None, body: body.into_bytes() })
-            })
-        });
-        let config = |channel: &str| LogDestination {
-            webhook_url: Some("https://discord.com/api/webhooks/123456789012345678/token".into()),
-            guild_id: Some("123456789012345678".into()),
-            channel_id: Some(channel.into()),
-        };
-        let wrong = TranscriptLogService::with_transport(config("323456789012345678"), transport.clone());
-        wrong.initialize().await;
-        let g = "123456789012345678";
-        assert!(!wrong.deliver(g, json!({}), "t.txt", b"x").await, "webhook in another channel is refused");
-        let service = TranscriptLogService::with_transport(config("223456789012345678"), transport);
-        assert!(!service.deliver(g, json!({}), "t.txt", b"x").await, "nothing is sent before verification");
-        service.initialize().await;
-        assert!(!service.deliver("999999999999999999", json!({}), "t.txt", b"x").await, "another server's transcript never reaches the operator");
-        assert!(service.deliver(g, json!({"title": "t"}), "ticket.txt", b"body").await);
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].filename, "ticket.txt");
-        assert!(sent[0].payload_json.contains("\"parse\":[]"));
     }
 }

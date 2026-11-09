@@ -51,7 +51,7 @@ if [ ! -f .env ]; then
   say "First-time setup. Press Enter to keep the [default]."
   echo "  Token: https://discord.com/developers/applications -> your app -> Bot -> Reset Token"
   echo "  Also turn on 'Message Content Intent' on that page (needed for ticket transcripts)."
-  echo "  Log channels (optional) are set in .env afterwards: see .env.example."
+  echo "  Log channels are set in Discord afterwards: run /ticket in your server."
   while :; do
     read -rsp "Discord bot token: " token </dev/tty || die "No input."
     echo

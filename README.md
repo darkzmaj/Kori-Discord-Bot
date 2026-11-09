@@ -28,12 +28,13 @@ Kori is a self-hosted, multi-server Discord ticket and support bot. Each server'
 
 Everything happens in `/ticket`, an ephemeral dashboard with native Discord pickers. Changes are saved immediately.
 
+0. **Logging Setup.** The first time `/ticket` runs in a server, it asks how Kori should log: **Global** or **Per server** (see [Logs](#logs)). Only the server owner can answer. Every server Kori joins goes through this once.
 1. **Setup.** Click **Create Category** to make a private `Tickets` category, or use **Set Category** to pick an existing one. You can pause new tickets at any time with **Disable**.
 2. **Staff Roles.** Add as many roles as you like whose members can see new tickets, claim them and manage members. The picker takes up to 25 roles at a time; pick again to add more. Discord Administrators always count as staff.
 3. **Ticket Types** (optional). Add up to 25 types, such as *Support* or *Billing*, each with an optional description and emoji. With types, the panel shows a selector and channels are named `billing-username`. Without types, the panel shows one **Open Ticket** button and channels are named `ticket-username`.
 4. **Panel.** Click **Edit Embed** to set the panel's title, description, colour, image and footer; the form shows the current values. Check it with **Preview**, then post it with **Send Panel**. From then on, every change updates the posted panel in place, with no resending: embed edits, and adding, editing or removing ticket types. **Move Panel** posts it to another channel and removes the old one. **Reset Embed** returns to Kori's default.
 5. **Ticket Welcome** (optional). Edit the title and description of the message Kori posts at the top of every new ticket. `{user}` mentions the ticket creator and `{type}` inserts the ticket type. Switch **Ping Creator** and **Ping Staff Roles** on or off to choose who that message notifies. **Preview** shows it without pinging anyone, and **Reset Message** returns to the default.
-6. **Logs**. Pick a private staff channel for ticket activity and one for closed-ticket transcripts. Kori posts a confirmation in each to prove it can write there.
+6. **Logs**. Pick a private staff channel for ticket activity and one for closed-ticket transcripts (in global mode, on the log server). Kori posts a confirmation in each to prove it can write there.
 
 `/ticket` opens on an overview of the whole current setup: status, category, staff roles, ticket types, where the panel is posted (with a jump link) and how many tickets are open. Everything can be changed afterwards: toggle tickets, change or remove the category, add or remove staff roles, add, edit or remove ticket types, and edit or move the panel.
 
@@ -46,7 +47,7 @@ Everything happens in `/ticket`, an ephemeral dashboard with native Discord pick
 - **Reclaiming.** `/reclaim` (Administrator only) makes the administrator the claimer and removes the previous claimer's access.
 - **Members.** `/add` and `/remove` work inside a ticket. They can be used by the claimer, by an administrator, or by any staff member while the ticket is unclaimed. The opener and the claimer always keep access, and bots cannot be added.
 - **Closing.** The **Close** button opens a form with an optional reason; submitting it is the confirmation. `/close` takes an optional `reason` too. The opener, the claimer, administrators, and staff on an unclaimed ticket can close it. The channel is deleted 5 seconds later. If a ticket channel is deleted by hand, its record closes automatically, including while Kori is offline.
-- **Transcripts.** Before deleting the channel, Kori saves every message to a `.txt` transcript. The transcript lists the ticket title, the channel, who opened, claimed and closed it, the reason, all participants (opener, claimer, added members and everyone who wrote), and when the ticket was created and deleted. Kori posts it, with a summary, to the server's transcript channel (set in `/ticket` → **Logs**), and sends the same summary and transcript to the opener by DM. Transcripts keep the latest 10,000 messages and stay under 8 MB.
+- **Transcripts.** Before deleting the channel, Kori saves every message to a `.txt` transcript. The transcript lists the ticket title, the channel, who opened, claimed and closed it, the reason, all participants (opener, claimer, added members and everyone who wrote), and when the ticket was created and deleted. Kori posts it, with a summary, to the transcript channel chosen in `/ticket` → **Logs**, and sends the same summary and transcript to the opener by DM. Transcripts keep the latest 10,000 messages and stay under 8 MB.
 
 Discord Administrators bypass channel overwrites, so they can always read every ticket. This is how Discord works and Kori cannot change it.
 
@@ -59,30 +60,26 @@ Everything ticket-related is configured per server with `/ticket`. Operator-leve
 | `DISCORD_TOKEN` | yes | — | Bot token. |
 | `APPLICATION_ID` | no | — | Safety check that the token belongs to this application. |
 | `DATABASE_PATH` | no | `./data/kori.sqlite` | SQLite file (fixed to `/app/data/kori.sqlite` in Docker). |
-| `LOG_WEBHOOK_URL`, `LOG_GUILD_ID`, `LOG_CHANNEL_ID` | no | — | Bot owner's log: bot health for every server, plus ticket activity from `LOG_GUILD_ID` only. |
-| `TRANSCRIPT_WEBHOOK_URL`, `TRANSCRIPT_GUILD_ID`, `TRANSCRIPT_CHANNEL_ID` | no | — | Bot owner's transcript log: transcripts from `TRANSCRIPT_GUILD_ID` only. |
 | `DIAGNOSTIC_GUILD_ID`, `DIAGNOSTIC_USER_ID` | no | — | Extra detail for `rake commands:inspect`. |
 | `KORI_HEALTH_ADDR` | no | off | Health check for uptime monitors, for example `0.0.0.0:8080`. `GET /health` (or `/`) answers `ok` (200) only while Kori is connected to Discord, `disconnected` (503) otherwise. |
 
-Kori checks its configuration at startup. If something is wrong, such as a missing token or a log with only some of its three values set, it exits with a clear message.
+Kori checks its configuration at startup. If something is wrong, such as a missing token, it exits with a clear message. There are no log settings here: log channels are chosen in Discord.
 
 ## Logs
 
-A server's ticket activity and transcripts never leave that server. Each server's administrators choose two channels in `/ticket` → **Logs**:
+Kori logs into Discord channels you pick from menus; there are no webhooks to create. The first time `/ticket` runs in a server, the server owner chooses how that server logs:
+
+- **🌐 Global:** logs from every server in global mode go to one **log server**, and each log shows which server it came from. Bot health (started, shutting down, startup failed, joined or left a server) goes there too. The first server to choose Global becomes the log server; its owner sets the default channels and can give any server its own channels there with **Server Channels**. Another server in global mode can take over as log server with **Make This the Log Server**, but moving it away from an existing log server takes that server's owner. Choose this when Kori is your own bot.
+- **🏠 Per server:** the server's logs stay in that server, in channels it picks itself. Nothing is shared.
+
+If the Discord application is public (**Public Bot** is on in the Developer Portal, so anyone can invite it), Global is not offered and every server is per server: everyone who adds it effectively has their own bot. Kori reads that switch when it starts.
+
+Each mode has two channels:
 
 - **Activity log:** every ticket opened, claimed, reclaimed, closed (with the reason) and deleted (with transcript and DM delivery status); members added and removed; and every `/ticket` configuration change.
 - **Transcripts:** one message per closed ticket with its summary and the `.txt` transcript attached.
 
-Kori saves a channel only after it has posted a confirmation there, so a channel it cannot write to is refused straight away. Keep both channels private to staff: transcripts contain every ticket message.
-
-As the bot owner, you can also set two webhooks in `.env`. Each is optional, but set all three of its values or none.
-
-- **Owner's log** (`LOG_*`): bot health for every server (started, shutting down, startup failed, joined or left a server), plus ticket activity from `LOG_GUILD_ID` when that server has no activity log channel of its own.
-- **Owner's transcript log** (`TRANSCRIPT_*`): transcripts from `TRANSCRIPT_GUILD_ID` when that server has no transcript channel of its own.
-
-Other servers' activity and transcripts never reach these webhooks.
-
-Create each webhook in its channel (Channel Settings → Integrations → Webhooks) and use separate channels for the two logs. Before sending anything, Kori checks that each webhook belongs to the guild and channel IDs you gave; if it doesn't, that log stays off. Webhook URLs are secrets and never appear in Kori's own logs. Process diagnostics still go to stdout as JSON for your container or service manager.
+Kori saves a channel only after it has posted a confirmation there, so a channel it cannot write to is refused straight away. Keep these channels private to staff: transcripts contain every ticket message. The owner can change the mode at any time in `/ticket` → **Logs** → **Change Mode**. Process diagnostics still go to stdout as JSON for your container or service manager.
 
 ## Running from source
 
@@ -143,7 +140,7 @@ Back up the SQLite database while the process is stopped, or use SQLite's online
 
 `Dockerfile` builds a multi-stage, non-root production image: a Rust build stage, then a Ruby 3.4 slim runtime with the `kori` binary and the Ruby tooling. `docker-compose.yml` runs it with a named volume for `/app/data`, a read-only root filesystem, dropped capabilities and `no-new-privileges`. Migrations run automatically on startup and slash commands resynchronize on ready, so no extra setup is needed beyond the environment variables.
 
-In Coolify, create a new resource from this repository with **Docker Compose** as the build pack. Then set at least `DISCORD_TOKEN` (and optionally `APPLICATION_ID` and the logging variables) under Environment Variables. Do not set `DATABASE_PATH`. Kori only makes outbound connections to the Discord gateway, so no port is needed. For an uptime monitor, set `KORI_HEALTH_ADDR=0.0.0.0:8080` and route a domain or path to container port 8080. The check also answers at `/`, so a proxy that strips its path prefix (such as `https://example.com/kori-health`) works; have the monitor look for the keyword `ok`.
+In Coolify, create a new resource from this repository with **Docker Compose** as the build pack. Then set `DISCORD_TOKEN` (and optionally `APPLICATION_ID`) under Environment Variables. Do not set `DATABASE_PATH`. Kori only makes outbound connections to the Discord gateway, so no port is needed. For an uptime monitor, set `KORI_HEALTH_ADDR=0.0.0.0:8080` and route a domain or path to container port 8080. The check also answers at `/`, so a proxy that strips its path prefix (such as `https://example.com/kori-health`) works; have the monitor look for the keyword `ok`.
 
 Inside the container, the tooling is available as `bundle exec rake commands:sync`, `commands:inspect` and `migrate`.
 

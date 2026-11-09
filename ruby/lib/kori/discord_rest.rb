@@ -46,7 +46,7 @@ module Kori
       uri = URI("#{BASE}#{path}")
       req = klass.new(uri)
       req['Authorization'] = "Bot #{@token}"
-      req['User-Agent'] = 'DiscordBot (https://github.com/darkzmaj/Kori-Discord-Bot, 1.0.1) Kori'
+      req['User-Agent'] = 'DiscordBot (https://github.com/darkzmaj/Kori-Discord-Bot, 2.0.0) Kori'
       if body
         req['Content-Type'] = 'application/json'
         req.body = JSON.generate(body)

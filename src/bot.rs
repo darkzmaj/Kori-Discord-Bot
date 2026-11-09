@@ -1,5 +1,4 @@
 //! Kori bot: gateway event wiring and interaction dispatch to the ticket services.
-use crate::config::Config;
 use crate::ctx;
 use crate::db::repositories::KoriRepository;
 use crate::discord::Discord;
@@ -8,7 +7,7 @@ use crate::services::audit_log_service::{AuditEvent, AuditLogService, AuditSubje
 use crate::services::command_sync::CommandSynchronizer;
 use crate::services::ticket_service::TicketService;
 use crate::services::ticket_ui::TicketUi;
-use crate::services::transcript_service::TranscriptLogService;
+use crate::services::log_routing::LogRouter;
 use serde_json::json;
 use serenity::all::{
     ChannelId, CommandInteraction, ComponentInteraction, ComponentInteractionDataKind, Context, CreateInteractionResponse,
@@ -83,7 +82,6 @@ pub struct KoriBot {
     pub discord: Discord,
     repo: Arc<KoriRepository>,
     pub tickets: Arc<TicketService>,
-    pub transcripts: Arc<TranscriptLogService>,
     pub ticket_ui: Arc<TicketUi>,
     pub audit: Arc<AuditLogService>,
     command_sync: Arc<CommandSynchronizer>,
@@ -102,10 +100,9 @@ fn subject(id: impl ToString, name: Option<String>) -> Option<AuditSubject> {
 }
 
 impl KoriBot {
-    pub fn new(repo: Arc<KoriRepository>, application_id: Option<String>, config: &Config, discord: Discord) -> Self {
-        let audit = Arc::new(AuditLogService::new(config.audit_logging.clone(), reqwest::Client::new()));
-        let transcripts = Arc::new(TranscriptLogService::new(config.transcript_logging.clone(), reqwest::Client::new()));
-        let tickets = Arc::new(TicketService::new(repo.clone(), discord.clone(), Some(audit.clone()), transcripts.clone()));
+    pub fn new(repo: Arc<KoriRepository>, application_id: Option<String>, discord: Discord) -> Self {
+        let audit = Arc::new(AuditLogService::new(Arc::new(LogRouter::new(repo.clone())), discord.http.clone()));
+        let tickets = Arc::new(TicketService::new(repo.clone(), discord.clone(), audit.clone()));
         let command_sync = Arc::new(CommandSynchronizer::new(repo.clone(), application_id));
         let started_at = Arc::new(Mutex::new(Instant::now()));
         let uptime_start = started_at.clone();
@@ -118,7 +115,6 @@ impl KoriBot {
             discord,
             repo,
             tickets,
-            transcripts,
             ticket_ui,
             audit,
             command_sync,
@@ -137,15 +133,15 @@ impl KoriBot {
             "Kori started",
             ctx! {"version" => env!("CARGO_PKG_VERSION"), "guilds" => guilds.len(), "userId" => self.discord.cache.current_user().id.to_string(), "applicationId" => self.discord.http.application_id().map(|a| a.to_string())},
         );
+        // A public bot is always per server. If Discord cannot say, stay per server until the next start.
+        match self.discord.http.get_current_application_info().await {
+            Ok(app) => self.audit.router().set_public(app.bot_public),
+            Err(error) => logger::warn("could not read the application's Public Bot setting; global logging stays off", ctx! {"error" => error.to_string()}),
+        }
         self.audit.record(AuditEvent {
             details: vec![("Guilds".into(), json!(guilds.len())), ("Version".into(), json!(env!("CARGO_PKG_VERSION")))],
             ..audit_event("Kori Started", "Bot", "success")
         });
-        // Webhook destination validation is observability-only and never affects startup.
-        let audit = self.audit.clone();
-        tokio::spawn(async move { audit.initialize().await });
-        let transcripts = self.transcripts.clone();
-        tokio::spawn(async move { transcripts.initialize().await });
         self.command_sync.synchronize(&self.discord, false).await?;
         for guild_id in guilds {
             self.repo.ensure_guild(&guild_id.to_string())?;
@@ -181,11 +177,7 @@ impl KoriBot {
         if settings.panel_channel_id.as_deref() == Some(channel.as_str()) {
             self.repo.set_panel_message(&guild, None)?;
         }
-        for (key, configured) in [("log_channel_id", &settings.log_channel_id), ("transcript_channel_id", &settings.transcript_channel_id)] {
-            if configured.as_deref() == Some(channel.as_str()) {
-                self.repo.update_setting(&guild, key, rusqlite::types::Value::Null)?;
-            }
-        }
+        self.repo.forget_log_channel(&channel)?;
         self.tickets.on_channel_delete(guild_id, channel_id)?;
         Ok(())
     }

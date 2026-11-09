@@ -19,9 +19,10 @@ use crate::ctx;
 use crate::db::repositories::{GuildSettings, KoriRepository, PanelEmbed, Ticket, TicketType};
 use crate::discord::Discord;
 use crate::logger::{self, log_discord_error};
-use crate::services::audit_log_service::{render_event, AuditEvent, AuditLogService, AuditSubject};
+use crate::services::audit_log_service::{AuditEvent, AuditLogService, AuditSubject};
+use crate::services::log_routing::{LogRouter, TRANSCRIPTS};
 use crate::services::locks::KeyedLock;
-use crate::services::transcript_service::{render_transcript, summary_embed, TranscriptLogService, TranscriptMeta, MAX_TRANSCRIPT_MESSAGES};
+use crate::services::transcript_service::{render_transcript, summary_embed, TranscriptMeta, MAX_TRANSCRIPT_MESSAGES};
 
 const COLOR: u32 = crate::discord::KORI_BLUE;
 /// Per-member message cooldown in every ticket channel (Discord slowmode).
@@ -342,32 +343,29 @@ fn snowflake(value: &str) -> Option<u64> {
 pub struct TicketService {
     repo: Arc<KoriRepository>,
     discord: Discord,
-    audit: Option<Arc<AuditLogService>>,
-    transcripts: Arc<TranscriptLogService>,
+    audit: Arc<AuditLogService>,
     opening: KeyedLock,
     /// guild:user -> when their last ticket was created.
     recent: Mutex<HashMap<String, Instant>>,
 }
 
 impl TicketService {
-    pub fn new(repo: Arc<KoriRepository>, discord: Discord, audit: Option<Arc<AuditLogService>>, transcripts: Arc<TranscriptLogService>) -> Self {
-        TicketService { repo, discord, audit, transcripts, opening: KeyedLock::default(), recent: Mutex::default() }
+    pub fn new(repo: Arc<KoriRepository>, discord: Discord, audit: Arc<AuditLogService>) -> Self {
+        TicketService { repo, discord, audit, opening: KeyedLock::default(), recent: Mutex::default() }
     }
 
-    /// Logs one event for `guild_id`: see [`route_log`].
-    pub fn log(&self, guild_id: GuildId, event: AuditEvent) {
-        route_log(&self.repo, &self.discord, self.audit.as_deref(), guild_id, event);
+    /// Logs one event to wherever `guild_id`'s activity logs go (see `log_routing`).
+    pub fn log(&self, event: AuditEvent) {
+        self.audit.record(event);
     }
 
-    /// Whether the operator's `.env` webhooks cover this server: (main log, transcripts).
-    pub fn operator_logs(&self, guild_id: GuildId) -> (bool, bool) {
-        let gs = guild_id.to_string();
-        (self.audit.as_ref().is_some_and(|a| a.covers(&gs)), self.transcripts.enabled_for(&gs))
+    pub fn router(&self) -> &Arc<LogRouter> {
+        self.audit.router()
     }
 
     fn record(&self, title: &str, color: &str, guild_id: GuildId, actor: Option<&User>, details: Vec<(&str, String)>) {
         let guild_name = self.discord.cache.guild(guild_id).map(|g| g.name.clone());
-        self.log(guild_id, AuditEvent {
+        self.log(AuditEvent {
             title: title.into(),
             category: "Tickets".into(),
             color: color.into(),
@@ -915,7 +913,6 @@ impl TicketService {
         let job = Teardown {
             repo: self.repo.clone(),
             discord: self.discord.clone(),
-            transcripts: self.transcripts.clone(),
             audit: self.audit.clone(),
             guild_id,
             ticket,
@@ -997,33 +994,10 @@ async fn fetch_messages(http: &Arc<Http>, channel: ChannelId) -> (Vec<Message>, 
     (all, truncated)
 }
 
-/// Posts a server's event to the log channel it chose in `/ticket`. Without one, the event goes to the operator's
-/// log webhook, which only accepts the operator's own server (and bot health).
-pub fn route_log(repo: &Arc<KoriRepository>, discord: &Discord, audit: Option<&AuditLogService>, guild_id: GuildId, event: AuditEvent) {
-    let gs = guild_id.to_string();
-    let Some(channel) = repo.settings(&gs).ok().and_then(|s| s.log_channel_id).and_then(|c| snowflake(&c)).map(ChannelId::new) else {
-        if let Some(audit) = audit {
-            audit.record(event);
-        }
-        return;
-    };
-    let body = serde_json::json!({"embeds": [render_event(event)], "allowed_mentions": {"parse": []}});
-    let (http, repo) = (discord.http.clone(), repo.clone());
-    tokio::spawn(async move {
-        if let Err(error) = http.send_message(channel, vec![], &body).await {
-            if logger::discord_code(&error) == Some(10003) {
-                let _ = repo.update_setting(&gs, "log_channel_id", rusqlite::types::Value::Null);
-            }
-            log_discord_error("ticket.log.channel", &error.into(), ctx! {"guildId" => gs, "channelId" => channel.to_string()});
-        }
-    });
-}
-
 struct Teardown {
     repo: Arc<KoriRepository>,
     discord: Discord,
-    transcripts: Arc<TranscriptLogService>,
-    audit: Option<Arc<AuditLogService>>,
+    audit: Arc<AuditLogService>,
     guild_id: GuildId,
     ticket: Ticket,
     closer: User,
@@ -1086,20 +1060,14 @@ impl Teardown {
         let embed = summary_embed(&meta, &self.ticket.opener_id, &self.closer.id.to_string(), self.ticket.claimed_by_id.as_deref(), &ids);
 
         let gs = self.guild_id.to_string();
-        // The server's own transcript channel; otherwise the operator's webhook (own server only).
-        let own = self.repo.settings(&gs).ok().and_then(|s| s.transcript_channel_id).and_then(|c| snowflake(&c)).map(ChannelId::new);
-        let (configured, logged) = match own {
+        // This server's transcript channel, or the log server's in global mode.
+        let (configured, logged) = match self.audit.router().channel(Some(self.guild_id), TRANSCRIPTS) {
             Some(channel) => {
                 let body = serde_json::json!({"embeds": [embed.clone()], "allowed_mentions": {"parse": []}});
                 let sent = http.send_message(channel, vec![CreateAttachment::bytes(text.as_bytes().to_vec(), filename.clone())], &body).await;
-                if let Err(error) = &sent {
-                    if logger::discord_code(error) == Some(10003) {
-                        let _ = self.repo.update_setting(&gs, "transcript_channel_id", rusqlite::types::Value::Null);
-                    }
-                }
                 (true, sent.map_err(|e| log_discord_error("ticket.transcript.channel", &e.into(), ctx! {"guildId" => gs.clone()})).is_ok())
             }
-            None => (self.transcripts.enabled_for(&gs), self.transcripts.deliver(&gs, embed.clone(), &filename, text.as_bytes()).await),
+            None => (false, false),
         };
         let dm = async {
             let opener = UserId::new(snowflake(&self.ticket.opener_id).ok_or_else(|| anyhow::anyhow!("invalid opener"))?);
@@ -1118,7 +1086,7 @@ impl Teardown {
         };
         {
             let guild_name = meta.guild_name.clone();
-            route_log(&self.repo, &self.discord, self.audit.as_deref(), self.guild_id, AuditEvent {
+            self.audit.record(AuditEvent {
                 title: "Ticket Deleted".into(),
                 category: "Tickets".into(),
                 color: if deleted && dm_sent && (logged || !configured) { "info".into() } else { "warning".into() },
@@ -1305,6 +1273,7 @@ mod tests {
         );
         h.repo.update_setting("1", "ticket_category_id", rusqlite::types::Value::Text("50".into())).unwrap();
         h.repo.add_staff_role("1", &STAFF.to_string(), "8").unwrap();
+        h.repo.update_setting("1", "log_mode", rusqlite::types::Value::Text("server".into())).unwrap();
         let bot = h.bot();
         (h, bot)
     }

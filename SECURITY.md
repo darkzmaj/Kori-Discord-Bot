@@ -14,9 +14,9 @@ otherwise.
 
 ## Operator checklist
 
-- Transcripts contain everything written in a ticket. Keep the transcript log channel private to the
-  people who should read them.
-- Keep `DISCORD_TOKEN` and webhook URLs out of git. `.env` is ignored; the installer creates it with
+- Transcripts contain everything written in a ticket. Keep transcript channels private to the people
+  who should read them. In global mode, every server's transcripts reach the log server.
+- Keep `DISCORD_TOKEN` out of git. `.env` is ignored; the installer creates it with
   owner-only permissions. If a token leaks, reset it in the Discord Developer Portal immediately.
 - Grant Kori only the permissions listed in the README. It never needs Administrator.
 - Remember that Discord Administrators bypass channel overwrites: they can read every ticket.

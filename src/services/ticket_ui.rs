@@ -16,6 +16,7 @@ use crate::discord::Discord;
 use crate::logger::log_discord_error;
 use crate::services::audit_log_service::{AuditEvent, AuditSubject};
 use crate::services::authorization::{has_permission, PermissionLevel};
+use crate::services::log_routing::{LogRouter, ACTIVITY, GLOBAL, PER_SERVER, TRANSCRIPTS};
 use crate::services::ticket_service::{
     bot_allow, creatable, panel_components, panel_embed, parse_panel_embed, parse_welcome, valid_emoji, welcome_pings, welcome_view, PanelUpdate,
     TicketService, DEFAULT_PANEL_DESCRIPTION, DEFAULT_PANEL_TITLE, DEFAULT_WELCOME_DESCRIPTION, DEFAULT_WELCOME_TITLE, MAX_TICKET_TYPES,
@@ -26,6 +27,24 @@ const COLOR: u32 = crate::discord::KORI_BLUE;
 
 fn snowflake(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|v| *v != 0)
+}
+
+const BOT: &str = "Kori";
+
+fn guild_name(ctx: &Context, id: &str) -> String {
+    snowflake(id).and_then(|g| ctx.cache.guild(GuildId::new(g)).map(|g| g.name.clone())).unwrap_or_else(|| format!("Server {id}"))
+}
+
+fn kind_what(kind: &str) -> &'static str {
+    if kind == TRANSCRIPTS { "closed-ticket transcripts" } else { "ticket activity logs" }
+}
+
+fn kind_label(kind: &str) -> &'static str {
+    if kind == TRANSCRIPTS { "Transcripts" } else { "Activity Log" }
+}
+
+fn channel_line(channel: &Option<String>) -> String {
+    channel.as_ref().map(|id| format!("<#{id}>")).unwrap_or_else(|| "⚪ Not set".into())
 }
 
 /// An interaction payload: `None` content leaves the message's current content untouched.
@@ -199,7 +218,7 @@ impl TicketUi {
 
     fn audit_configuration(&self, ctx: &Context, a: &Actor<'_>, title: &str, details: Vec<(&str, String)>) {
         let guild_name = ctx.cache.guild(a.guild_id).map(|g| g.name.clone()).unwrap_or_default();
-        self.tickets.log(a.guild_id, AuditEvent {
+        self.tickets.log(AuditEvent {
             title: title.into(),
             category: "Ticket Configuration".into(),
             color: "warning".into(),
@@ -234,7 +253,7 @@ impl TicketUi {
         }
         // Best effort: a transient Discord error leaves the tracked panel as it is.
         let _ = self.tickets.verify_panel(guild_id).await;
-        let view = self.dashboard(ctx, guild_id)?;
+        let view = if self.tickets.router().mode(guild_id).is_none() { self.log_mode_view(guild_id) } else { self.dashboard(ctx, guild_id)? };
         a.respond(ctx, CreateInteractionResponse::Message(view.message().ephemeral(true))).await
     }
 
@@ -258,7 +277,7 @@ impl TicketUi {
         let g = a.guild_id;
         let gs = g.to_string();
         if !matches!(i.data.kind, ComponentInteractionDataKind::Button) {
-            return self.handle_select(ctx, &a, kind, &values(i)).await;
+            return self.handle_select(ctx, &a, kind, action, &values(i)).await;
         }
         match (kind, action) {
             ("nav", section) => a.update(ctx, self.view(ctx, g, section)?).await,
@@ -378,8 +397,14 @@ impl TicketUi {
                     .ephemeral(true);
                 a.respond(ctx, CreateInteractionResponse::Message(preview)).await
             }
+            ("logmode", choice @ (GLOBAL | PER_SERVER)) => self.set_log_mode(ctx, &a, choice).await,
+            ("logmode", "change") => a.update(ctx, self.log_mode_view(g)).await,
+            ("logs", "hub") => self.make_hub(ctx, &a).await,
             ("logs", which @ ("pick" | "pickt")) => {
-                let (kind, what) = if which == "pick" { ("logset", "ticket activity logs") } else { ("transcriptset", "closed-ticket transcripts") };
+                if !self.edits_own_channels(g) {
+                    return a.update(ctx, self.view(ctx, g, "logs")?).await;
+                }
+                let (kind, what) = if which == "pick" { ("logset", kind_what(ACTIVITY)) } else { ("transcriptset", kind_what(TRANSCRIPTS)) };
                 let picker = select(
                     format!("ticketui:{kind}:x:{g}"),
                     CreateSelectMenuKind::Channel { channel_types: Some(vec![ChannelType::Text]), default_channels: None },
@@ -388,11 +413,44 @@ impl TicketUi {
                 a.update(ctx, View::text(format!("Select the channel for {what}. Keep it private to staff."), vec![picker, row(vec![nav("logs", g, "← Back")])])).await
             }
             ("logs", which @ ("clear" | "cleart")) => {
-                let (key, title) = if which == "clear" { ("log_channel_id", "Ticket Log Channel Cleared") } else { ("transcript_channel_id", "Ticket Transcript Channel Cleared") };
-                self.repo.update_setting(&gs, key, rusqlite::types::Value::Null)?;
-                self.audit_configuration(ctx, &a, title, vec![]);
+                if self.edits_own_channels(g) {
+                    let (key, title) = if which == "clear" { (ACTIVITY, "Ticket Log Channel Cleared") } else { (TRANSCRIPTS, "Ticket Transcript Channel Cleared") };
+                    self.repo.update_setting(&gs, key, rusqlite::types::Value::Null)?;
+                    self.audit_configuration(ctx, &a, title, vec![]);
+                }
                 a.update(ctx, self.view(ctx, g, "logs")?).await
             }
+            ("logs", "servers") => {
+                let options: Vec<CreateSelectMenuOption> = if self.tickets.router().hub() == Some(g) {
+                    self.repo.global_guilds()?.into_iter().take(25).map(|id| CreateSelectMenuOption::new(guild_name(ctx, &id), id)).collect()
+                } else {
+                    Vec::new()
+                };
+                if options.is_empty() {
+                    return a.update(ctx, self.view(ctx, g, "logs")?).await;
+                }
+                let picker = select(format!("ticketui:routesrc:x:{g}"), CreateSelectMenuKind::String { options }, "Select a server");
+                a.update(ctx, View::text("Select a server in global mode to give its logs their own channels here.", vec![picker, row(vec![nav("logs", g, "← Back")])])).await
+            }
+            ("routeview", source) => a.update(ctx, self.route_view(ctx, g, source)?).await,
+            ("route", spec) => {
+                let Some((kind, source)) = self.route_spec(g, spec) else { return a.update(ctx, self.view(ctx, g, "logs")?).await };
+                let picker = select(
+                    format!("ticketui:routeset:{spec}:{g}"),
+                    CreateSelectMenuKind::Channel { channel_types: Some(vec![ChannelType::Text]), default_channels: None },
+                    "Select a text channel",
+                );
+                let back = button(format!("ticketui:routeview:{source}:{g}"), "← Back", ButtonStyle::Primary);
+                a.update(ctx, View::text(format!("Select the channel in this server for {} from **{}**.", kind_what(kind), guild_name(ctx, &source)), vec![picker, row(vec![back])])).await
+            }
+            ("routeclr", spec) => match self.route_spec(g, spec) {
+                Some((kind, source)) => {
+                    self.repo.set_log_route(&source, kind, None)?;
+                    self.audit_configuration(ctx, &a, "Server Log Channel Cleared", vec![("Server", guild_name(ctx, &source)), ("Log", kind_label(kind).into())]);
+                    a.update(ctx, self.route_view(ctx, g, &source)?).await
+                }
+                None => a.update(ctx, self.view(ctx, g, "logs")?).await,
+            },
             ("panel", "send") => {
                 let picker = select(
                     format!("ticketui:panelsend:x:{g}"),
@@ -405,7 +463,7 @@ impl TicketUi {
         }
     }
 
-    async fn handle_select(&self, ctx: &Context, a: &Actor<'_>, kind: &str, values: &[String]) -> anyhow::Result<()> {
+    async fn handle_select(&self, ctx: &Context, a: &Actor<'_>, kind: &str, action: &str, values: &[String]) -> anyhow::Result<()> {
         let g = a.guild_id;
         let gs = g.to_string();
         let value = values.first().map(String::as_str).unwrap_or_default();
@@ -469,6 +527,8 @@ impl TicketUi {
             },
             "panelsend" => self.send_panel(ctx, a, value).await,
             "logset" | "transcriptset" => self.set_log_channel(ctx, a, kind == "logset", value).await,
+            "routesrc" => a.update(ctx, self.route_view(ctx, g, value)?).await,
+            "routeset" => self.set_route_channel(ctx, a, action, value).await,
             _ => Ok(()),
         }
     }
@@ -573,46 +633,203 @@ impl TicketUi {
         a.update(ctx, self.view(ctx, g, "setup")?.content(Some(notice))).await
     }
 
-    /// Saves a log or transcript channel only after Kori has posted a confirmation there, which proves it can.
-    async fn set_log_channel(&self, ctx: &Context, a: &Actor<'_>, activity: bool, channel: &str) -> anyhow::Result<()> {
+    /// The first menu of `/ticket` (the same as Gaia's `/admin`): global or per-server logging.
+    fn log_mode_view(&self, g: GuildId) -> View {
+        let router = self.tickets.router();
+        let public = router.is_public();
+        let mut text = format!(
+            "**How should {BOT} log?**\n\n🌐 **Global**: logs from every server {BOT} is in go to one log server, and each log shows which server it came from. You can give each server its own channels there. Choose this when {BOT} is your own bot.\n\n🏠 **Per server**: this server's logs stay in this server. Nothing is shared with other servers."
+        );
+        if public {
+            text.push_str(&format!("\n\n🔒 {BOT} is a public bot, so logs always stay per server."));
+        }
+        text.push_str("\n\nOnly the server owner can choose. You can change it later in **Logs**.");
+        let mut buttons = vec![
+            button(format!("ticketui:logmode:{GLOBAL}:{g}"), "Global", ButtonStyle::Primary).disabled(public),
+            button(format!("ticketui:logmode:{PER_SERVER}:{g}"), "Per server", ButtonStyle::Primary),
+        ];
+        if router.mode(g).is_some() {
+            buttons.push(nav("logs", g, "← Back"));
+        }
+        View::embed(CreateEmbed::new().color(COLOR).title("Logging Setup").description(text), vec![row(buttons)])
+    }
+
+    async fn set_log_mode(&self, ctx: &Context, a: &Actor<'_>, choice: &str) -> anyhow::Result<()> {
+        let g = a.guild_id;
+        let router = self.tickets.router().clone();
+        if !LogRouter::is_owner(&ctx.cache, g, a.user.id) {
+            return a.reply(ctx, format!("Only the server owner can choose how {BOT} logs.")).await;
+        }
+        if choice == GLOBAL && router.is_public() {
+            return a.reply(ctx, format!("{BOT} is a public bot, so logs always stay per server.")).await;
+        }
+        let gs = g.to_string();
+        let hub = router.hub();
+        self.repo.update_setting(&gs, "log_mode", rusqlite::types::Value::Text(choice.into()))?;
+        let notice = if choice == GLOBAL {
+            match hub {
+                None => {
+                    self.repo.set_log_hub(Some(&gs))?;
+                    "🟢 Global. This server is the log server: set its channels below. Logs from every server in global mode arrive here.".to_string()
+                }
+                Some(h) if h == g => "🟢 Global. This server is the log server.".into(),
+                Some(h) => format!("🟢 Global. This server's logs go to the log server **{}**.", guild_name(ctx, &h.to_string())),
+            }
+        } else {
+            if hub == Some(g) {
+                self.repo.set_log_hub(None)?;
+            }
+            "🟢 Per server. Set this server's log channels below.".into()
+        };
+        self.audit_configuration(ctx, a, "Log Mode Set", vec![("Mode", if choice == GLOBAL { "Global" } else { "Per server" }.into())]);
+        a.update(ctx, self.view(ctx, g, "logs")?.content(Some(notice))).await
+    }
+
+    /// Makes this global-mode server the log server. Moving it away from another server takes that server's owner.
+    async fn make_hub(&self, ctx: &Context, a: &Actor<'_>) -> anyhow::Result<()> {
+        let g = a.guild_id;
+        let router = self.tickets.router().clone();
+        if router.mode(g) != Some(GLOBAL) {
+            return a.update(ctx, self.view(ctx, g, "logs")?).await;
+        }
+        if !LogRouter::is_owner(&ctx.cache, g, a.user.id) {
+            return a.reply(ctx, "Only the server owner can make this the log server.").await;
+        }
+        if let Some(hub) = router.hub().filter(|h| *h != g && ctx.cache.guild(*h).is_some()) {
+            if !LogRouter::is_owner(&ctx.cache, hub, a.user.id) {
+                return a.reply(ctx, format!("Only the owner of the current log server (**{}**) can move it.", guild_name(ctx, &hub.to_string()))).await;
+            }
+        }
+        self.repo.set_log_hub(Some(&g.to_string()))?;
+        self.audit_configuration(ctx, a, "Log Server Changed", vec![]);
+        a.update(ctx, self.view(ctx, g, "logs")?.content(Some("🟢 This is now the log server. Set its channels below.".into()))).await
+    }
+
+    /// Whether this server sets its own log channels: per server, or the log server in global mode.
+    fn edits_own_channels(&self, g: GuildId) -> bool {
+        let router = self.tickets.router();
+        match router.mode(g) {
+            Some(PER_SERVER) => true,
+            Some(_) => router.hub() == Some(g),
+            None => false,
+        }
+    }
+
+    /// `a<id>` / `t<id>`: a log kind for a global-mode server, valid only in the log server.
+    fn route_spec(&self, g: GuildId, spec: &str) -> Option<(&'static str, String)> {
+        if self.tickets.router().hub() != Some(g) {
+            return None;
+        }
+        let kind = match spec.chars().next()? {
+            'a' => ACTIVITY,
+            't' => TRANSCRIPTS,
+            _ => return None,
+        };
+        let source = &spec[1..];
+        let global = self.repo.global_guilds().ok()?;
+        global.iter().any(|id| id == source).then(|| (kind, source.to_string()))
+    }
+
+    fn route_view(&self, ctx: &Context, g: GuildId, source: &str) -> anyhow::Result<View> {
+        if self.route_spec(g, &format!("a{source}")).is_none() {
+            return self.view(ctx, g, "logs");
+        }
+        let hub = self.repo.settings(&g.to_string())?;
+        let line = |kind: &str, default: &Option<String>| match self.repo.log_route(source, kind).ok().flatten() {
+            Some(id) => format!("<#{id}>"),
+            None => format!("Default: {}", channel_line(default)),
+        };
+        let has = |kind: &str| self.repo.log_route(source, kind).ok().flatten().is_some();
+        let text = format!(
+            "**{}** is in global mode, so its logs arrive in this server. Give them their own channels here, or leave them on this server's defaults.\n\n**Activity Log**\n{}\n\n**Transcripts**\n{}",
+            guild_name(ctx, source),
+            line(ACTIVITY, &hub.log_channel_id),
+            line(TRANSCRIPTS, &hub.transcript_channel_id),
+        );
+        let b = |kind: &str, action: &str, label: &str, style: ButtonStyle| button(format!("ticketui:{kind}:{action}{source}:{g}"), label, style);
+        Ok(View::embed(
+            CreateEmbed::new().color(COLOR).title("Server Channels").description(text),
+            vec![row(vec![
+                b("route", "a", "Set Activity Channel", ButtonStyle::Primary),
+                b("route", "t", "Set Transcript Channel", ButtonStyle::Primary),
+                b("routeclr", "a", "Use Default Activity", ButtonStyle::Secondary).disabled(!has(ACTIVITY)),
+                b("routeclr", "t", "Use Default Transcripts", ButtonStyle::Secondary).disabled(!has(TRANSCRIPTS)),
+                nav("logs", g, "← Back"),
+            ])],
+        ))
+    }
+
+    /// Posts a confirmation in `channel` (a text channel of this server): proof that Kori can write there.
+    async fn confirm_channel(&self, ctx: &Context, a: &Actor<'_>, channel: &str, what: &str) -> Result<ChannelId, String> {
         let g = a.guild_id;
         let Some(channel_id) = snowflake(channel)
             .map(ChannelId::new)
             .filter(|id| ctx.cache.guild(g).is_some_and(|guild| guild.channels.get(id).is_some_and(|c| c.kind == ChannelType::Text)))
         else {
-            return a.update(ctx, self.view(ctx, g, "logs")?.content(Some("That channel no longer exists.".into()))).await;
-        };
-        let (key, what, title) = if activity {
-            ("log_channel_id", "ticket activity logs", "Ticket Log Channel Changed")
-        } else {
-            ("transcript_channel_id", "closed-ticket transcripts", "Ticket Transcript Channel Changed")
+            return Err("That channel no longer exists.".into());
         };
         let confirm = serde_json::json!({
             "embeds": [CreateEmbed::new().color(COLOR).title("Kori Tickets").description(format!("Kori will post {what} in this channel. Set by <@{}>.", a.user.id))],
             "allowed_mentions": {"parse": []},
         });
-        let notice = match ctx.http.send_message(channel_id, vec![], &confirm).await {
-            Ok(_) => {
-                self.repo.update_setting(&g.to_string(), key, rusqlite::types::Value::Text(channel_id.to_string()))?;
-                self.audit_configuration(ctx, a, title, vec![("Channel", format!("<#{channel_id}>"))]);
-                format!("🟢 Kori will post {what} in <#{channel_id}>.")
-            }
+        match ctx.http.send_message(channel_id, vec![], &confirm).await {
+            Ok(_) => Ok(channel_id),
             Err(error) => {
                 log_discord_error("ticket.logs.set", &error.into(), ctx! {"guildId" => g.to_string(), "channelId" => channel_id.to_string()});
-                format!("🔴 Not saved: Kori could not post in <#{channel_id}>. Give it View Channel, Send Messages, Embed Links and Attach Files there.")
+                Err(format!("🔴 Not saved: Kori could not post in <#{channel_id}>. Give it View Channel, Send Messages, Embed Links and Attach Files there."))
             }
+        }
+    }
+
+    /// Saves this server's own (or, on the log server, default) log channel once Kori has posted there.
+    async fn set_log_channel(&self, ctx: &Context, a: &Actor<'_>, activity: bool, channel: &str) -> anyhow::Result<()> {
+        let g = a.guild_id;
+        if !self.edits_own_channels(g) {
+            return a.update(ctx, self.view(ctx, g, "logs")?).await;
+        }
+        let (key, title) = if activity { (ACTIVITY, "Ticket Log Channel Changed") } else { (TRANSCRIPTS, "Ticket Transcript Channel Changed") };
+        let scope = if self.tickets.router().hub() == Some(g) { " from every server in global mode" } else { "" };
+        let what = format!("{}{scope}", kind_what(key));
+        let notice = match self.confirm_channel(ctx, a, channel, &what).await {
+            Ok(id) => {
+                self.repo.update_setting(&g.to_string(), key, rusqlite::types::Value::Text(id.to_string()))?;
+                self.audit_configuration(ctx, a, title, vec![("Channel", format!("<#{id}>"))]);
+                format!("🟢 Kori will post {what} in <#{id}>.")
+            }
+            Err(notice) => notice,
         };
         a.update(ctx, self.view(ctx, g, "logs")?.content(Some(notice))).await
     }
 
-    fn log_lines(&self, guild_id: GuildId, s: &GuildSettings) -> (String, String) {
-        let (operator_log, operator_transcripts) = self.tickets.operator_logs(guild_id);
-        let line = |channel: &Option<String>, operator: bool| match channel {
-            Some(id) => format!("<#{id}>"),
-            None if operator => "🟢 Bot owner's log webhook".into(),
-            None => "⚪ Not set".into(),
+    async fn set_route_channel(&self, ctx: &Context, a: &Actor<'_>, spec: &str, channel: &str) -> anyhow::Result<()> {
+        let g = a.guild_id;
+        let Some((kind, source)) = self.route_spec(g, spec) else { return a.update(ctx, self.view(ctx, g, "logs")?).await };
+        let what = format!("{} from {}", kind_what(kind), guild_name(ctx, &source));
+        let notice = match self.confirm_channel(ctx, a, channel, &what).await {
+            Ok(id) => {
+                self.repo.set_log_route(&source, kind, Some(&id.to_string()))?;
+                self.audit_configuration(ctx, a, "Server Log Channel Changed", vec![("Server", guild_name(ctx, &source)), ("Channel", format!("<#{id}>"))]);
+                format!("🟢 Kori will post {what} in <#{id}>.")
+            }
+            Err(notice) => notice,
         };
-        (line(&s.log_channel_id, operator_log), line(&s.transcript_channel_id, operator_transcripts))
+        a.update(ctx, self.route_view(ctx, g, &source)?.content(Some(notice))).await
+    }
+
+    fn logs_summary(&self, ctx: &Context, g: GuildId) -> anyhow::Result<String> {
+        let router = self.tickets.router();
+        Ok(match router.mode(g) {
+            None => "🟡 Not set up: open **Logs**".into(),
+            Some(PER_SERVER) => {
+                let s = self.repo.settings(&g.to_string())?;
+                format!("🏠 Per server • Activity: {} • Transcripts: {}", channel_line(&s.log_channel_id), channel_line(&s.transcript_channel_id))
+            }
+            Some(_) => match router.hub() {
+                Some(h) if h == g => "🌐 Global • this is the log server".into(),
+                Some(h) => format!("🌐 Global • logs go to **{}**", guild_name(ctx, &h.to_string())),
+                None => "🌐 Global • 🟡 no log server yet".into(),
+            },
+        })
     }
 
     async fn send_panel(&self, ctx: &Context, a: &Actor<'_>, channel: &str) -> anyhow::Result<()> {
@@ -651,10 +868,10 @@ impl TicketUi {
             }
             list
         };
-        let (log_line, transcript_line) = self.log_lines(guild_id, &s);
+        let logs = self.logs_summary(ctx, guild_id)?;
         let type_list = if types.is_empty() { "⚪ None — single **Open Ticket** button".to_string() } else { types.iter().map(type_line).collect::<Vec<_>>().join(", ") };
         let description = format!(
-            "Managing **{}**\n🟢 **Kori** online • Uptime: {}\n\n**Status**\n{}\n\n**Ticket Category**\n{}\n\n**Staff Roles** ({})\n{staff_list}\n\n**Ticket Types** ({})\n{type_list}\n\n**Panel**\n**{}** — {}\n\n**Ticket Welcome**\n**{}** — pings {}\n\n**Logs**\nActivity: {log_line} • Transcripts: {transcript_line}\n\n**Open Tickets**\n{open}",
+            "Managing **{}**\n🟢 **Kori** online • Uptime: {}\n\n**Status**\n{}\n\n**Ticket Category**\n{}\n\n**Staff Roles** ({})\n{staff_list}\n\n**Ticket Types** ({})\n{type_list}\n\n**Panel**\n**{}** — {}\n\n**Ticket Welcome**\n**{}** — pings {}\n\n**Logs**\n{logs}\n\n**Open Tickets**\n{open}",
             ctx.cache.guild(guild_id).map(|g| g.name.clone()).unwrap_or_default(),
             (self.uptime)(),
             if s.tickets_enabled != 0 { "🟢 Enabled — members can open tickets" } else { "🔴 Disabled — new tickets are paused" },
@@ -798,21 +1015,53 @@ impl TicketUi {
                 ))
             }
             "logs" => {
+                let router = self.tickets.router();
+                let Some(mode) = router.mode(g) else { return Ok(self.log_mode_view(g)) };
                 let s = self.repo.settings(&gs)?;
-                let (log_line, transcript_line) = self.log_lines(g, &s);
-                let text = format!(
-                    "Kori posts this server's ticket activity (opened, claimed, members added or removed, closed, setup changes) and the `.txt` transcript of every closed ticket in channels you choose. They stay in this server. Transcripts contain every ticket message, so keep these channels private to staff. Members still get their own transcript by DM.\n\n**Activity Log**\n{log_line}\n\n**Transcripts**\n{transcript_line}"
-                );
-                Ok(View::embed(
-                    CreateEmbed::new().color(COLOR).title("Logs").description(text),
-                    vec![row(vec![
-                        act("logs", "pick", g, "Set Log Channel", ButtonStyle::Primary),
-                        act("logs", "pickt", g, "Set Transcript Channel", ButtonStyle::Primary),
-                        act("logs", "clear", g, "Clear Log", ButtonStyle::Secondary).disabled(s.log_channel_id.is_none()),
-                        act("logs", "cleart", g, "Clear Transcripts", ButtonStyle::Secondary).disabled(s.transcript_channel_id.is_none()),
-                        back(),
-                    ])],
-                ))
+                let own = row(vec![
+                    act("logs", "pick", g, "Set Log Channel", ButtonStyle::Primary),
+                    act("logs", "pickt", g, "Set Transcript Channel", ButtonStyle::Primary),
+                    act("logs", "clear", g, "Clear Log", ButtonStyle::Secondary).disabled(s.log_channel_id.is_none()),
+                    act("logs", "cleart", g, "Clear Transcripts", ButtonStyle::Secondary).disabled(s.transcript_channel_id.is_none()),
+                ]);
+                let change = act("logmode", "change", g, "Change Mode", ButtonStyle::Secondary);
+                let private = "Transcripts contain every ticket message, so keep these channels private to staff. Members still get their own transcript by DM.";
+                let hub = router.hub();
+                let (text, rows) = if mode == PER_SERVER {
+                    (
+                        format!(
+                            "**Mode:** 🏠 Per server. This server's ticket activity (opened, claimed, members added or removed, closed, setup changes) and the `.txt` transcript of every closed ticket go to channels here, and stay in this server.\n\n**Activity Log**\n{}\n\n**Transcripts**\n{}\n\n{private}",
+                            channel_line(&s.log_channel_id),
+                            channel_line(&s.transcript_channel_id),
+                        ),
+                        vec![own, row(vec![change, back()])],
+                    )
+                } else if hub == Some(g) {
+                    let servers = self.repo.global_guilds()?;
+                    let mut list = servers.iter().take(20).map(|id| format!("• {}", guild_name(ctx, id))).collect::<Vec<_>>().join("\n");
+                    if servers.len() > 20 {
+                        list.push_str(&format!("\n…and {} more", servers.len() - 20));
+                    }
+                    (
+                        format!(
+                            "**Mode:** 🌐 Global. **This is the log server.** Logs from every server in global mode arrive here, and each log shows which server it came from. Bot health (started, stopped, joined or left a server) arrives here too.\n\n**Activity Log** (default)\n{}\n\n**Transcripts** (default)\n{}\n\n**Servers in global mode** ({})\n{list}\n\n**Server Channels** gives a server its own channels here. {private}",
+                            channel_line(&s.log_channel_id),
+                            channel_line(&s.transcript_channel_id),
+                            servers.len(),
+                        ),
+                        vec![own, row(vec![act("logs", "servers", g, "Server Channels", ButtonStyle::Primary).disabled(servers.is_empty()), change, back()])],
+                    )
+                } else {
+                    let destination = match hub {
+                        Some(h) => format!("This server's logs go to the log server **{}**, where its owner sets the channels.", guild_name(ctx, &h.to_string())),
+                        None => "🟡 There is no log server yet, so nothing is logged. Make one server in global mode the log server.".into(),
+                    };
+                    (
+                        format!("**Mode:** 🌐 Global. {destination}"),
+                        vec![row(vec![act("logs", "hub", g, "Make This the Log Server", ButtonStyle::Success), change, back()])],
+                    )
+                };
+                Ok(View::embed(CreateEmbed::new().color(COLOR).title("Logs").description(text), rows))
             }
             _ => self.dashboard(ctx, g),
         }
@@ -855,6 +1104,7 @@ mod tests {
                 .member(8, &[40])
                 .member(9, &[]),
         );
+        h.repo.update_setting("1", "log_mode", rusqlite::types::Value::Text("server".into())).unwrap();
         let bot = h.bot();
         (h, bot)
     }
@@ -908,6 +1158,80 @@ mod tests {
         assert!(reply(&h)["data"]["content"].as_str().unwrap().contains("was deleted"));
         assert!(h.repo.settings("1").unwrap().panel_message_id.is_none());
         assert!(h.repo.settings("1").unwrap().panel_title.is_none(), "reset to defaults");
+    }
+
+    fn message_json(channel: &str) -> serde_json::Value {
+        json!({"id": "900", "channel_id": channel, "author": crate::test_support::user_json(crate::test_support::BOT_ID),
+            "content": "", "timestamp": "2026-01-01T00:00:00.000Z", "edited_timestamp": null, "tts": false, "mention_everyone": false,
+            "mentions": [], "mention_roles": [], "attachments": [], "embeds": [], "pinned": false, "type": 0})
+    }
+
+    async fn posted_with_title(h: &Harness, channel: &str, title: &str) -> Vec<serde_json::Value> {
+        for _ in 0..100 {
+            let found: Vec<_> = h.calls_to("POST", &format!("/channels/{channel}/messages")).into_iter().map(|c| c.body).filter(|b| b["embeds"][0]["title"] == title).collect();
+            if !found.is_empty() {
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Vec::new()
+    }
+
+    #[tokio::test]
+    async fn first_ticket_command_asks_how_to_log_and_only_the_owner_answers() {
+        let h = Harness::start().await;
+        let admin = Permissions::ADMINISTRATOR;
+        // Two servers owned by 8; 7 is an administrator but not an owner.
+        h.seed(GuildSeed::new(11, "Main").owner(8).role(111, "Admin", 5, admin).channel(1160, ChannelType::Text, None).channel(1161, ChannelType::Text, None).bot(&[]).member(8, &[111]).member(7, &[111]));
+        h.seed(GuildSeed::new(12, "Other").owner(8).role(121, "Admin", 5, admin).bot(&[]).member(8, &[121]));
+        h.seed(GuildSeed::new(13, "Third").owner(8).role(131, "Admin", 5, admin).bot(&[]).member(8, &[131]));
+        for channel in ["1160", "1161"] {
+            h.on("POST", &format!("/channels/{channel}/messages"), 200, message_json(channel));
+        }
+        let bot = h.bot();
+        let ctx = h.ctx();
+
+        bot.on_interaction(&ctx, &Interaction::Command(h.command(11, 8, "ticket", json!([])))).await;
+        let first = reply(&h);
+        assert_eq!(first["data"]["embeds"][0]["title"], "Logging Setup", "the first menu asks how to log");
+        assert!(first["data"]["embeds"][0]["description"].as_str().unwrap().starts_with("**How should Kori log?**"));
+
+        bot.on_interaction(&ctx, &Interaction::Component(h.button(11, 7, "ticketui:logmode:global:11"))).await;
+        assert_eq!(reply(&h)["data"]["content"], "Only the server owner can choose how Kori logs.");
+        assert!(h.repo.settings("11").unwrap().log_mode.is_none());
+
+        // The owner picks global: with no log server yet, this server becomes it.
+        bot.on_interaction(&ctx, &Interaction::Component(h.button(11, 8, "ticketui:logmode:global:11"))).await;
+        assert_eq!(h.repo.settings("11").unwrap().log_mode.as_deref(), Some("global"));
+        assert_eq!(h.repo.log_hub().unwrap().as_deref(), Some("11"));
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(11, 8, "ticketui:logset:x:11", 8, &["1160"]))).await;
+        assert_eq!(h.repo.settings("11").unwrap().log_channel_id.as_deref(), Some("1160"));
+
+        // Another server joins global mode: its logs arrive in the log server and say where they came from.
+        bot.on_interaction(&ctx, &Interaction::Component(h.button(12, 8, "ticketui:logmode:global:12"))).await;
+        let logged = posted_with_title(&h, "1160", "Log Mode Set").await;
+        assert!(logged.iter().any(|b| b.to_string().contains("Other")), "{logged:?}");
+        // It cannot set channels of its own while in global mode.
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(12, 8, "ticketui:logset:x:12", 8, &["1160"]))).await;
+        assert!(h.repo.settings("12").unwrap().log_channel_id.is_none());
+
+        // The log server gives that server its own channel.
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(11, 8, "ticketui:routeset:a12:11", 8, &["1161"]))).await;
+        assert_eq!(h.repo.log_route("12", "log_channel_id").unwrap().as_deref(), Some("1161"));
+        bot.on_interaction(&ctx, &Interaction::Component(h.button(12, 8, "ticketui:toggle:tickets:12"))).await;
+        assert!(!posted_with_title(&h, "1161", "Tickets Disabled").await.is_empty(), "server-specific channel used");
+        // Routes can only be set from the log server.
+        bot.on_interaction(&ctx, &Interaction::Component(h.select(12, 8, "ticketui:routeset:a11:12", 8, &["1161"]))).await;
+        assert!(h.repo.log_route("11", "log_channel_id").unwrap().is_none());
+
+        // A public bot offers no global mode.
+        bot.audit.router().set_public(true);
+        bot.on_interaction(&ctx, &Interaction::Command(h.command(13, 8, "ticket", json!([])))).await;
+        let menu = reply(&h);
+        assert!(menu["data"]["embeds"][0]["description"].as_str().unwrap().contains("public bot"));
+        assert_eq!(menu["data"]["components"][0]["components"][0]["disabled"], true);
+        bot.on_interaction(&ctx, &Interaction::Component(h.button(13, 8, "ticketui:logmode:global:13"))).await;
+        assert!(h.repo.settings("13").unwrap().log_mode.is_none());
     }
 
     #[tokio::test]

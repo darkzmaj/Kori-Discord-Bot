@@ -2,8 +2,14 @@
 
 All notable changes to Kori are documented here. Kori follows [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 2.0.0 — 2026-11-09
 
+- **Logging Setup.** The first `/ticket` in a server asks its owner how Kori logs: **Global** (every server's logs go
+  to one log server, each showing where it came from, with optional server-specific channels there) or
+  **Per server** (logs stay in that server). A public bot is always per server.
+- All log channels are picked in `/ticket` → **Logs**. The `LOG_*` and `TRANSCRIPT_*` webhook settings are gone:
+  remove them from `.env`.
+- Log delivery goes through the bot itself, in order, with no webhooks to create or keep secret.
 - Optional health check for uptime monitors (`KORI_HEALTH_ADDR`, for example `0.0.0.0:8080`): `GET /health`
   (or `/`, for proxies that strip a path prefix) answers `ok` (200) only while Kori is connected to Discord, and
   `disconnected` (503) otherwise. Off when unset. The Docker image and compose file expose port 8080.

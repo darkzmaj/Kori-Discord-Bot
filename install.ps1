@@ -35,7 +35,7 @@ if (-not (Test-Path .env)) {
     Say 'First-time setup. Press Enter to keep the [default].'
     Write-Host '  Token: https://discord.com/developers/applications -> your app -> Bot -> Reset Token'
     Write-Host "  Also turn on 'Message Content Intent' on that page (needed for ticket transcripts)."
-    Write-Host '  Log channels (optional) are set in .env afterwards: see .env.example.'
+    Write-Host '  Log channels are set in Discord afterwards: run /ticket in your server.'
     while ($true) {
         $secure = Read-Host 'Discord bot token' -AsSecureString
         $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))

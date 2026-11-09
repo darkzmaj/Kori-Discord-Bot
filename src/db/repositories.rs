@@ -27,6 +27,8 @@ pub struct GuildSettings {
     /// This server's own log and transcript channels; `None` = not set.
     pub log_channel_id: Option<String>,
     pub transcript_channel_id: Option<String>,
+    /// "global" | "server"; `None` until the server owner chooses.
+    pub log_mode: Option<String>,
 }
 /// The editable panel embed. `None` fields fall back to Kori's defaults.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -141,7 +143,7 @@ impl KoriRepository {
     pub fn update_setting(&self, guild_id: &str, key: &str, value: Value) -> Result<()> {
         let key = checked(
             key,
-            &["tickets_enabled", "ticket_category_id", "welcome_ping_opener", "welcome_ping_staff", "log_channel_id", "transcript_channel_id"],
+            &["tickets_enabled", "ticket_category_id", "welcome_ping_opener", "welcome_ping_staff", "log_channel_id", "transcript_channel_id", "log_mode"],
         )?;
         let c = self.conn();
         ensure_guild(&c, guild_id)?;
@@ -177,9 +179,65 @@ impl KoriRepository {
         Ok(())
     }
 
+    // ---- log routing (see services::log_routing) ----
+
+    pub fn log_hub(&self) -> Result<Option<String>> {
+        Ok(self.conn().query_row("SELECT guild_id FROM log_hub WHERE id = 1", [], |r| r.get(0)).ok())
+    }
+    /// Moving the log server drops the old one's server-specific channels: they were channels in it.
+    pub fn set_log_hub(&self, guild_id: Option<&str>) -> Result<()> {
+        let c = self.conn();
+        c.execute("DELETE FROM log_routes", [])?;
+        match guild_id {
+            Some(g) => c.execute(
+                "INSERT INTO log_hub(id, guild_id, updated_at) VALUES (1, ?1, ?2) ON CONFLICT(id) DO UPDATE SET guild_id = ?1, updated_at = ?2",
+                params![g, now()],
+            )?,
+            None => c.execute("DELETE FROM log_hub", [])?,
+        };
+        Ok(())
+    }
+    pub fn log_route(&self, source_guild_id: &str, kind: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT channel_id FROM log_routes WHERE source_guild_id = ? AND kind = ?", params![source_guild_id, kind], |r| r.get(0))
+            .ok())
+    }
+    pub fn set_log_route(&self, source_guild_id: &str, kind: &str, channel_id: Option<&str>) -> Result<()> {
+        let c = self.conn();
+        match channel_id {
+            Some(ch) => c.execute(
+                "INSERT INTO log_routes(source_guild_id, kind, channel_id) VALUES (?1, ?2, ?3) ON CONFLICT(source_guild_id, kind) DO UPDATE SET channel_id = ?3",
+                params![source_guild_id, kind, ch],
+            )?,
+            None => c.execute("DELETE FROM log_routes WHERE source_guild_id = ? AND kind = ?", params![source_guild_id, kind])?,
+        };
+        Ok(())
+    }
+    /// Servers whose owner chose global mode.
+    pub fn global_guilds(&self) -> Result<Vec<String>> {
+        let c = self.conn();
+        let mut stmt = c.prepare("SELECT guild_id FROM guild_settings WHERE log_mode = 'global' ORDER BY guild_id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+    /// A deleted channel stops being any server's log channel or server-specific channel.
+    pub fn forget_log_channel(&self, channel_id: &str) -> Result<()> {
+        let c = self.conn();
+        for column in ["log_channel_id", "transcript_channel_id"] {
+            c.execute(&format!("UPDATE guild_settings SET {column} = NULL WHERE {column} = ?"), params![channel_id])?;
+        }
+        c.execute("DELETE FROM log_routes WHERE channel_id = ?", params![channel_id])?;
+        Ok(())
+    }
+
     pub fn purge_guild(&self, guild_id: &str) -> Result<()> {
         let mut c = self.conn();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM log_routes WHERE source_guild_id = ?", params![guild_id])?;
+        if tx.execute("DELETE FROM log_hub WHERE guild_id = ?", params![guild_id])? > 0 {
+            tx.execute("DELETE FROM log_routes", [])?;
+        }
         for table in [
             "ticket_staff_roles",
             "ticket_types",

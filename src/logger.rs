@@ -107,11 +107,9 @@ mod tests {
             token: FAKE_TOKEN.into(),
             database_path: "./data/kori.sqlite".into(),
             application_id: Some("1".into()),
-            audit_logging: crate::config::LogDestination { webhook_url: Some("https://x/api/webhooks/1/secret-hook".into()), ..Default::default() },
-            transcript_logging: crate::config::LogDestination { webhook_url: Some("https://x/api/webhooks/2/secret-hook".into()), ..Default::default() },
         };
         let printed = format!("{config:?}");
-        assert!(!printed.contains("GhIjKl") && !printed.contains("secret-hook"), "{printed}");
+        assert!(!printed.contains("GhIjKl"), "{printed}");
         assert!(printed.contains("./data/kori.sqlite"));
     }
 }

@@ -15,10 +15,8 @@
 //! because Discord does that through gateway events, which do not exist here.
 // Shared harness: not every helper is exercised by every test module.
 #![allow(dead_code)]
-use crate::config::LogDestination;
 use crate::db::repositories::KoriRepository;
 use crate::discord::Discord;
-use crate::services::audit_log_service::{AuditLogService, WebhookResponse};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::response::Response;
@@ -33,8 +31,6 @@ use std::sync::{Arc, Mutex};
 pub const BOT_ID: u64 = 900;
 pub const APP_ID: u64 = 901;
 pub const TIMESTAMP: &str = "2026-01-01T00:00:00.000Z";
-const AUDIT_GUILD: &str = "123456789012345678";
-const AUDIT_CHANNEL: &str = "223456789012345678";
 
 /// One request the bot sent. `body` is `Null` for empty or non-JSON (multipart) bodies.
 #[derive(Debug, Clone)]
@@ -292,9 +288,6 @@ pub struct Harness {
     fake: Arc<Mutex<Fake>>,
     pub discord: Discord,
     pub repo: Arc<KoriRepository>,
-    /// Audit log whose webhook deliveries are captured; read them with [`Harness::audits`].
-    pub audit: Arc<AuditLogService>,
-    audits: Arc<Mutex<Vec<Value>>>,
 }
 
 pub fn repo() -> Arc<KoriRepository> {
@@ -324,32 +317,7 @@ impl Harness {
         });
         cache.update(&mut serde_json::from_value::<ReadyEvent>(json!(ready)).unwrap());
 
-        let audits = Arc::new(Mutex::new(Vec::new()));
-        let sink = audits.clone();
-        let transport: crate::services::audit_log_service::WebhookTransport = Arc::new(move |_url, body: Option<String>| {
-            let sink = sink.clone();
-            Box::pin(async move {
-                let body = match body {
-                    None => json!({"guild_id": AUDIT_GUILD, "channel_id": AUDIT_CHANNEL}).to_string(),
-                    Some(payload) => {
-                        let payload: Value = serde_json::from_str(&payload)?;
-                        sink.lock().unwrap().push(payload["embeds"][0].clone());
-                        String::new()
-                    }
-                };
-                Ok(WebhookResponse { status: 200, retry_after: None, body: body.into_bytes() })
-            })
-        });
-        let config = LogDestination {
-            webhook_url: Some(format!("https://discord.com/api/webhooks/{AUDIT_GUILD}/test-token")),
-            guild_id: Some(AUDIT_GUILD.into()),
-            channel_id: Some(AUDIT_CHANNEL.into()),
-        };
-        let audit = Arc::new(AuditLogService::with_transport(config, transport));
-        audit.initialize().await;
-        assert!(audit.enabled(), "capturing audit log failed to start");
-
-        Self { fake, discord: Discord { http: Arc::new(http), cache }, repo: repo(), audit, audits }
+        Self { fake, discord: Discord { http: Arc::new(http), cache }, repo: repo() }
     }
 
     /// Applies the guild to the cache (as GUILD_CREATE) and registers its members with the fake REST API.
@@ -403,12 +371,6 @@ impl Harness {
         fake.calls.iter().filter(|c| c.method == "POST" && matches("/channels/*/messages", &c.path)).filter(dm).map(|c| c.body.clone()).collect()
     }
 
-    /// Embeds delivered to the audit log so far (waits for the delivery worker).
-    pub async fn audits(&self) -> Vec<Value> {
-        self.audit.idle().await;
-        self.audits.lock().unwrap().clone()
-    }
-
     pub fn member(&self, guild: u64, user: u64) -> serenity::all::Member {
         self.discord.cache.guild(GuildId::new(guild)).and_then(|g| g.members.get(&UserId::new(user)).cloned()).expect("member not seeded")
     }
@@ -426,15 +388,11 @@ impl Harness {
 
     /// The full bot over the harness's Discord and repository, for driving `on_interaction(&h.ctx(), ..)`.
     /// Its own audit log is unconfigured; services built by hand can use [`Harness::audit`] instead.
+    /// A bot whose Discord application is private (global logging allowed), as `on_ready` would find it.
     pub fn bot(&self) -> crate::bot::KoriBot {
-        let config = crate::config::Config {
-            token: String::new(),
-            database_path: String::new(),
-            application_id: Some(APP_ID.to_string()),
-            audit_logging: Default::default(),
-            transcript_logging: Default::default(),
-        };
-        crate::bot::KoriBot::new(self.repo.clone(), config.application_id.clone(), &config, self.discord.clone())
+        let bot = crate::bot::KoriBot::new(self.repo.clone(), Some(APP_ID.to_string()), self.discord.clone());
+        bot.audit.router().set_public(false);
+        bot
     }
 
     fn next_id(&self) -> String {
