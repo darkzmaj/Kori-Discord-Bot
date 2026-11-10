@@ -10,6 +10,8 @@ mod logger;
 mod services;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod stress;
 
 use bot::{KoriBot, Handler};
 use db::repositories::KoriRepository;
